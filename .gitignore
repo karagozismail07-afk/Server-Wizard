@@ -1,0 +1,17 @@
+# Runtime data - never commit inventory, caches or logs
+Cache/
+App/
+*.log
+ScanCache.xml
+GroupOverrides.xml
+*.tmp
+*.exe
+*.ico
+
+# Reports
+ServerWizard_Report_*.csv
+ServerWizard_*.csv
+
+# OS noise
+Thumbs.db
+desktop.ini
