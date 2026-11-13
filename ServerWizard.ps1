@@ -32,7 +32,7 @@ function Set-DoubleBuffered($ctrl) {
 }
 
 # --- Version ---------------------------------------------------------------
-$script:AppVersion = '1.6'
+$script:AppVersion = '1.6.1'
 
 # --- UI font: Open Sans if installed on this server, else Segoe UI ---------
 $script:FontName = 'Segoe UI'
@@ -2455,13 +2455,10 @@ function ConvertTo-SafeCsvRow($row) {
     return [PSCustomObject]$o
 }
 
-# Default report language (remembered for the session; set by the Export dialog)
-$script:ReportLangDefault = 'tr'
 
 function Get-ReportScopeText([string[]]$Roles, [int]$serverCount, [bool]$AllServers) {
     $r = if (@($Roles).Count -gt 0) { (@($Roles) -join ', ') } else { (T 'scope_all_roles') }
     $s = if ($AllServers) { "all scanned servers" } else { "selected servers" }
-    if ($script:RptLang -eq 'tr') { $s = if ($AllServers) { 'taranan t&#252;m sunucular' } else { 'se&#231;ili sunucular' } }
     # Plain text: the renderer HTML-encodes it
     return [Net.WebUtility]::HtmlDecode("$r | $s")
 }
@@ -2471,14 +2468,14 @@ function Invoke-RoleReport {
     param(
         [ValidateSet('Html', 'Pdf', 'Both')][string]$Format = 'Html',
         [string[]]$Roles = @(),
-        [switch]$AllServers,
-        [ValidateSet('tr', 'en')][string]$Language = 'tr'
+        [switch]$AllServers
     )
+    $Language = 'en'   # report output is English only
     if ($script:Results.Keys.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Run a scan first.", "Export Report", "OK", "Information") | Out-Null
         return
     }
-    $keys = @(Get-ReportServerKeys -Roles $Roles -AllServers:$AllServers)
+    $keys = [string[]](Get-ReportServerKeys -Roles $Roles -AllServers:$AllServers)
     if ($keys.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("No scanned server matches the selected roles.", "Export Report", "OK", "Information") | Out-Null
         return
@@ -2695,8 +2692,8 @@ function Open-ReportsTab {
 
         $cmb.Add_SelectedIndexChanged({ try { Show-ReportSection } catch { Write-Log "Report section failed: $($_.Exception.Message)" } })
         $btnRefresh.Add_Click({ Update-ReportsTab $true })
-        $btnHtml.Add_Click({ Invoke-RoleReport -Format Html -Language $script:ReportLangDefault })
-        $btnCsv.Add_Click({ Invoke-RoleReport -Format Pdf -Language $script:ReportLangDefault })
+        $btnHtml.Add_Click({ Invoke-RoleReport -Format Html })
+        $btnCsv.Add_Click({ Invoke-RoleReport -Format Pdf })
 
         $tp.Controls.Add($grid)
         $tp.Controls.Add($bar)      # added last = docked first (top)
@@ -2735,7 +2732,7 @@ $script:ReportText = @{
         d_certs = 'Certificates by expiry'
         s_calendar = 'Lifecycle calendar: next 12 months'
         cal_note = 'Vendor-published support dates and certificate expiry dates, by month.'
-        cal_none = 'No dates.'
+        cal_none = 'No vendor support date and no certificate expiry falls within the next 12 months.'
         ev_support = 'Mainstream support ends'
         ev_eol = 'End of support (EOL)'
         ev_esu = 'Paid extended security updates (ESU) end'
@@ -2817,111 +2814,6 @@ $script:ReportText = @{
         today = 'today'
         rescan = 'Rescan with v1.5 or later for details'
         more = 'and {0} more'
-        page_note = 'Server Wizard v{0}'
-    }
-    tr = @{
-        title = 'Sunucu Envanter Raporu'
-        generated = '{0} tarihinde {1} taraf&#305;ndan {2} &#252;zerinde olu&#351;turuldu'
-        scope = 'Kapsam'
-        scope_all_roles = 'T&#252;m roller'
-        servers_n = '{0} sunucu'
-        toc = '&#304;&#231;indekiler'
-        s_summary = '&#214;zet'
-        summary_note = 'Rakamlar rapor kapsam&#305;ndaki t&#252;m sunucular&#305; kapsar.'
-        k_servers = 'Sunucu'
-        k_roles = 'Rol grubu'
-        k_os = '&#304;&#351;letim sistemi s&#252;r&#252;m&#252;'
-        k_db = 'Veritaban&#305; motoru'
-        k_certs = 'Sertifika'
-        d_roles = 'Role g&#246;re sunucu say&#305;s&#305;'
-        d_os = '&#304;&#351;letim sistemi s&#252;r&#252;mleri'
-        d_db = 'Veritaban&#305; &#252;r&#252;n ve s&#252;r&#252;mleri'
-        d_status = 'Destek durumu (i&#351;letim sistemi, veritaban&#305;, IIS)'
-        d_certs = 'Biti&#351; tarihine g&#246;re sertifikalar'
-        s_calendar = 'Ya&#351;am d&#246;ng&#252;s&#252; takvimi: &#246;n&#252;m&#252;zdeki 12 ay'
-        cal_note = '&#220;reticilerin yay&#305;mlad&#305;&#287;&#305; destek tarihleri ve sertifika biti&#351; tarihleri, aylara g&#246;re.'
-        cal_none = 'Tarih yok.'
-        ev_support = 'Ana ak&#305;m destek sona eriyor'
-        ev_eol = 'Destek sona eriyor (EOL)'
-        ev_esu = '&#220;cretli geni&#351;letilmi&#351; g&#252;venlik g&#252;ncellemeleri (ESU) sona eriyor'
-        ev_cert = 'Sertifika s&#252;resi doluyor'
-        s_os = '&#304;&#351;letim sistemleri'
-        s_db = 'Veritabanlar&#305;'
-        s_iis = 'IIS / Web'
-        s_roles = 'Rol g&#246;r&#252;n&#252;mleri'
-        s_certs = 'Sertifikalar'
-        s_cards = 'Sunucu detaylar&#305;'
-        s_appendix = 'Kaynaklar ve y&#246;ntem'
-        s_evidence = 'Rol s&#305;n&#305;fland&#305;rmas&#305;'
-        c_server = 'Sunucu'
-        c_roles = 'Roller'
-        c_os = '&#304;&#351;letim sistemi'
-        c_build = 'Derleme'
-        c_installed = 'Kurulum'
-        c_restart = 'Son yeniden ba&#351;latma'
-        c_product = '&#220;r&#252;n'
-        c_version = 'S&#252;r&#252;m'
-        c_edition = 'S&#252;r&#252;m t&#252;r&#252; / instance'
-        c_mainstream = 'Ana ak&#305;m destek sonu'
-        c_support = 'Destek sonu'
-        c_eol = 'Destek sonu (EOL)'
-        c_esu = 'ESU sonu'
-        c_days = 'Kalan s&#252;re'
-        c_status = 'Durum'
-        c_source = 'Kaynak'
-        c_state = 'Servis'
-        c_sites = 'Siteler'
-        c_expires = 'Biti&#351;'
-        c_issuer = 'Yay&#305;mlayan'
-        c_inuse = 'Kullan&#305;mda'
-        c_name = 'Ad'
-        c_count = 'Adet'
-        c_date = 'Tarih'
-        c_event = 'Olay'
-        c_group = 'Rol grubu'
-        c_evidence = 'Gerek&#231;e'
-        c_retrieved = 'Al&#305;nma zaman&#305;'
-        c_url = 'Resmi kaynak'
-        c_ip = 'IP adresleri'
-        c_ports = 'Dinlenen portlar'
-        c_rolesvc = 'Roller ve rol servisleri'
-        c_features = '&#214;zellikler'
-        c_policy = 'Ya&#351;am d&#246;ng&#252;s&#252; politikas&#305;'
-        c_role_services = 'Rol servisleri'
-        yes = 'Evet'
-        no = 'Hay&#305;r'
-        not_bound = 'IIS''te ba&#287;l&#305; de&#287;il'
-        st_supported = 'Destekleniyor'
-        st_extended = 'Geni&#351;letilmi&#351; destek (yaln&#305;zca g&#252;venlik g&#252;ncellemeleri)'
-        st_eol = 'Destek sona erdi'
-        st_esu = 'Destek sona erdi (&#252;cretli ESU mevcut)'
-        st_noeol = 'Destekleniyor (biti&#351; tarihi ilan edilmedi)'
-        st_unknown = 'Resmi tarih bulunamad&#305;'
-        cs_expired = 'S&#252;resi doldu'
-        cs_30 = '30 g&#252;n i&#231;inde doluyor'
-        cs_90 = '31-90 g&#252;n i&#231;inde doluyor'
-        cs_365 = '91-365 g&#252;n i&#231;inde doluyor'
-        cs_later = 'Bir y&#305;ldan uzun ge&#231;erli'
-        f_roles = 'Roller'
-        f_all = 'T&#252;m&#252;'
-        f_dates = 'Yaln&#305;zca ge&#231;mi&#351; veya 90 g&#252;n i&#231;indeki tarihler'
-        f_search = 'Sunucu, &#252;r&#252;n, s&#252;r&#252;m, sertifika ara...'
-        f_reset = 'S&#305;f&#305;rla'
-        f_print = 'Yazd&#305;r / PDF'
-        f_hint = 'Filtreler detay tablolar&#305;na ve sunucu kartlar&#305;na uygulan&#305;r; &#246;zet her zaman rapor kapsam&#305;n&#305;n tamam&#305;n&#305; g&#246;sterir.'
-        m_dates = 'Destek ve destek sonu tarihleri, rapor olu&#351;turulurken yaln&#305;zca &#252;reticilerin resmi sayfalar&#305;ndan okunur; her tarihin kayna&#287;&#305; ve al&#305;nma zaman&#305; a&#351;a&#287;&#305;da listelenir.'
-        m_approx = '(yakla&#351;&#305;k) olarak i&#351;aretli kurulum tarihleri klas&#246;r veya dosya olu&#351;turulma zamanlar&#305;d&#305;r.'
-        m_certs = 'Sertifikalar LocalMachine\My ve WebHosting depolar&#305;ndan okunur; ''Kullan&#305;mda'', sertifikan&#305;n bir IIS sitesine ba&#287;l&#305; oldu&#287;unu g&#246;sterir.'
-        m_readonly = 'Salt okunur envanter: hi&#231;bir sunucuda de&#287;i&#351;iklik yap&#305;lmad&#305;.'
-        m_noeol = '''Biti&#351; tarihi ilan edilmedi'', &#252;reticinin resmi sayfas&#305;n&#305;n s&#252;r&#252;m&#252; biti&#351; tarihi olmadan desteklenen olarak listeledi&#287;i anlam&#305;na gelir.'
-        offline = 'resmi sayfan&#305;n &#231;evrimd&#305;&#351;&#305; kopyas&#305;'
-        approx = '(yakla&#351;&#305;k)'
-        none = 'Tespit edilmedi'
-        in_days = '{0} g&#252;n sonra'
-        days_ago = '{0} g&#252;n &#246;nce'
-        today = 'bug&#252;n'
-        rescan = 'Detaylar i&#231;in v1.5 veya sonras&#305; ile yeniden taray&#305;n'
-        more = 've {0} tane daha'
         page_note = 'Server Wizard v{0}'
     }
 }
@@ -3222,8 +3114,9 @@ function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText =
     for ($i = 0; $i -lt 12; $i++) {
         $ms = $start.AddMonths($i); $me = $ms.AddMonths(1)
         $mev = @($events | Where-Object { $_.Date -ge $ms -and $_.Date -lt $me })
+        if ($mev.Count -eq 0) { continue }
         [void]$sb.Append("<div class=""mon""><h4>$(HE $culture.TextInfo.ToTitleCase($ms.ToString('MMMM yyyy', $culture)))</h4>")
-        if ($mev.Count -eq 0) { [void]$sb.Append("<p class=""muted"">$(T 'cal_none')</p></div>"); continue }
+        if ($mev.Count -eq 0) { continue }
         [void]$sb.Append('<ul>')
         foreach ($grp in ($mev | Group-Object Date, Ev, Name | Sort-Object { $_.Group[0].Date }, { $_.Group[0].Name })) {
             $e0 = $grp.Group[0]
@@ -3235,11 +3128,13 @@ function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText =
         }
         [void]$sb.Append('</ul></div>')
     }
-    [void]$sb.Append('</div></section>')
+    [void]$sb.Append('</div>')
+    if ($events.Count -eq 0) { [void]$sb.Append("<p>$(T 'cal_none')</p>") }
+    [void]$sb.Append('</section>')
 
     # ---- 3. Operating systems -------------------------------------------------
     $sec = 3
-    [void]$sb.Append("<section id=""os"" class=""pb""><h2>$sec. $(T 's_os')</h2>")
+    [void]$sb.Append("<section id=""os""><h2>$sec. $(T 's_os')</h2>")
     $rows = foreach ($it in ($os | Sort-Object Name, Server)) {
         $r = $script:Results[$it.Server]
         $lc = $it.Lc
@@ -3256,7 +3151,7 @@ function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText =
     # ---- 4. Databases ------------------------------------------------------------
     if ($dbs.Count) {
         $sec++
-        [void]$sb.Append("<section id=""db"" class=""pb""><h2>$sec. $(T 's_db')</h2>")
+        [void]$sb.Append("<section id=""db""><h2>$sec. $(T 's_db')</h2>")
         $rows = foreach ($it in ($dbs | Sort-Object Product, Version, Server)) { New-LcRow $m $it -WithServer }
         [void]$sb.Append((New-RptTable (@((T 'c_server')) + $lcHeaders) @($rows) 't-db'))
         [void]$sb.Append('</section>')
@@ -3264,7 +3159,7 @@ function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText =
     # ---- 5. IIS -------------------------------------------------------------------
     if ($iis.Count) {
         $sec++
-        [void]$sb.Append("<section id=""iis"" class=""pb""><h2>$sec. $(T 's_iis')</h2>")
+        [void]$sb.Append("<section id=""iis""><h2>$sec. $(T 's_iis')</h2>")
         $rows = foreach ($it in ($iis | Sort-Object Name, Server)) {
             $row = New-LcRow $m $it -WithServer
             $row.Cells[3] = (Cell (HE ((@($it.Sites) -join ', '))))
@@ -3277,7 +3172,7 @@ function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText =
 
     # ---- Role views ----------------------------------------------------------------
     $sec++
-    [void]$sb.Append("<section id=""roles"" class=""pb""><h2>$sec. $(T 's_roles')</h2>")
+    [void]$sb.Append("<section id=""roles""><h2>$sec. $(T 's_roles')</h2>")
     foreach ($g in $groupsUsed) {
         $def = $script:RoleDefs | Where-Object { $_.Group -eq $g } | Select-Object -First 1
         [void]$sb.Append("<div class=""rolev"" data-roles=""$(HE $g)""><h3>$(HE $g) <span class=""muted"">&middot; $((T 'servers_n') -f $m.Groups[$g].Count)</span></h3>")
@@ -3304,7 +3199,7 @@ function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText =
 
     # ---- Certificates ------------------------------------------------------------------
     $sec++
-    [void]$sb.Append("<section id=""certs"" class=""pb""><h2>$sec. $(T 's_certs')</h2>")
+    [void]$sb.Append("<section id=""certs""><h2>$sec. $(T 's_certs')</h2>")
     $rows = foreach ($c in ($m.Certs | Sort-Object @{ Expression = { if ($null -eq $_.Days) { [int]::MaxValue } else { $_.Days } } }, Server)) {
         $use = if ($c.InUse.Count) { (T 'yes') + ': ' + (HE ($c.InUse -join ', ')) } else { (T 'no') }
         @{ Attrs = "data-roles=""$(Get-RolesAttr $m $c.Server)"" data-soon=""$(if (Test-Soon $c.Days) { '1' } else { '0' })"""
@@ -3431,7 +3326,7 @@ table.bars{width:100%;border-collapse:collapse} .bars td{padding:3px 4px;font-si
 table.grid{border-collapse:collapse;width:100%;font-size:12px}
 .grid th{background:var(--blue);color:#fff;text-align:left;padding:7px 8px;white-space:nowrap;cursor:pointer;user-select:none}
 .grid th .ar{font-size:9px;margin-left:4px} .grid td{border-top:1px solid var(--line);padding:5px 8px;vertical-align:top}
-.grid tr:nth-child(even) td{background:var(--row)} .nw{white-space:nowrap}
+.grid tr:nth-child(even) td{background:var(--row)} .nw{white-space:nowrap} .grid td:first-child{white-space:nowrap}
 .grid td a{color:var(--blue)}
 .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap}
 .pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.warn{background:var(--warn-bg);color:var(--warn)} .pill.soon{background:var(--soon-bg);color:var(--soon)}
@@ -3445,7 +3340,7 @@ ul.method{padding-left:18px} ul.method li{margin:3px 0}
 footer{color:var(--muted);font-size:11px;padding:8px 32px 24px;border-top:1px solid var(--line)}
 @page{size:A4 landscape;margin:12mm}
 @media print{.noprint{display:none!important}body{font-size:11px}.cover{padding:14px 18px}main{padding:0 6px;max-width:none}
-section.pb{break-before:page}.tw{overflow:visible;border:none}.grid th{background:var(--blue)!important}thead{display:table-header-group}tr{break-inside:avoid}.card{break-inside:avoid}}
+section.pb{break-before:page}h2,h3,h4{break-after:avoid}.panels,.kpis{break-inside:avoid}.tw{overflow:visible;border:none}.grid th{background:var(--blue)!important}thead{display:table-header-group}tr{break-inside:avoid}.card{break-inside:avoid}}
 '@
 
 $script:ReportJs = @'
@@ -3876,7 +3771,7 @@ function Show-ExportDialog {
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     $dlg.StartPosition = 'CenterParent'
-    $dlg.ClientSize = New-Object System.Drawing.Size(470, 580)
+    $dlg.ClientSize = New-Object System.Drawing.Size(470, 540)
     $dlg.Font = $form.Font
     $dlg.BackColor = [System.Drawing.Color]::White
     $dlg.ShowInTaskbar = $false
@@ -3934,35 +3829,26 @@ function Show-ExportDialog {
     $rbTab.Location = New-Object System.Drawing.Point(12, 94); $rbTab.AutoSize = $true; $rbTab.Enabled = $tabOk
     $grpFmt.Controls.AddRange(@($rbHtml, $rbPdf, $rbBoth, $rbTab))
 
-    $lblLang = New-Object System.Windows.Forms.Label
-    $lblLang.Text = 'Report language'; $lblLang.ForeColor = $script:MerlinBlue; $lblLang.AutoSize = $true
-    $lblLang.Location = New-Object System.Drawing.Point(16, 486)
-    $cmbLang = New-Object System.Windows.Forms.ComboBox
-    $cmbLang.DropDownStyle = 'DropDownList'
-    $cmbLang.Location = New-Object System.Drawing.Point(140, 482); $cmbLang.Size = New-Object System.Drawing.Size(160, 24)
-    [void]$cmbLang.Items.Add("T$([char]0x00FC)rk$([char]0x00E7)e"); [void]$cmbLang.Items.Add('English')
-    $cmbLang.SelectedIndex = if ($script:ReportLangDefault -eq 'en') { 1 } else { 0 }
-
-    $toggle = { $clb.Enabled = -not $rbTab.Checked; $grpSrv.Enabled = -not $rbTab.Checked; $cmbLang.Enabled = -not $rbTab.Checked }
+    $toggle = { $clb.Enabled = -not $rbTab.Checked; $grpSrv.Enabled = -not $rbTab.Checked }
     $rbTab.Add_CheckedChanged($toggle)
 
     $btnView = New-Object System.Windows.Forms.Button
     $btnView.Text = 'Open in-app view'; $btnView.FlatStyle = 'Flat'; $btnView.ForeColor = $script:MerlinBlue
-    $btnView.Location = New-Object System.Drawing.Point(14, 532); $btnView.Size = New-Object System.Drawing.Size(140, 32)
+    $btnView.Location = New-Object System.Drawing.Point(14, 492); $btnView.Size = New-Object System.Drawing.Size(140, 32)
     $btnView.DialogResult = [System.Windows.Forms.DialogResult]::Retry
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = 'Cancel'; $btnCancel.FlatStyle = 'Flat'
-    $btnCancel.Location = New-Object System.Drawing.Point(254, 532); $btnCancel.Size = New-Object System.Drawing.Size(90, 32)
+    $btnCancel.Location = New-Object System.Drawing.Point(254, 492); $btnCancel.Size = New-Object System.Drawing.Size(90, 32)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text = 'Export'; $btnOk.FlatStyle = 'Flat'
     $btnOk.BackColor = $script:MerlinYellow; $btnOk.ForeColor = $script:MerlinBlue
     $btnOk.Font = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
-    $btnOk.Location = New-Object System.Drawing.Point(354, 532); $btnOk.Size = New-Object System.Drawing.Size(102, 32)
+    $btnOk.Location = New-Object System.Drawing.Point(354, 492); $btnOk.Size = New-Object System.Drawing.Size(102, 32)
     $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $dlg.AcceptButton = $btnOk; $dlg.CancelButton = $btnCancel
 
-    $dlg.Controls.AddRange(@($lblRoles, $lnkAll, $lnkNone, $clb, $grpSrv, $grpFmt, $lblLang, $cmbLang, $btnView, $btnCancel, $btnOk))
+    $dlg.Controls.AddRange(@($lblRoles, $lnkAll, $lnkNone, $clb, $grpSrv, $grpFmt, $btnView, $btnCancel, $btnOk))
 
     try {
         $res = $dlg.ShowDialog($form)
@@ -3976,11 +3862,9 @@ function Show-ExportDialog {
         }
         # Every role ticked = no role filter (also keeps servers with no group)
         if ($roles.Count -eq $clb.Items.Count) { $roles = @() }
-        $script:ReportLangDefault = if ($cmbLang.SelectedIndex -eq 0) { 'tr' } else { 'en' }
         return @{
             Action     = 'Report'
             Format     = if ($rbPdf.Checked) { 'Pdf' } elseif ($rbBoth.Checked) { 'Both' } else { 'Html' }
-            Language   = if ($cmbLang.SelectedIndex -eq 0) { 'tr' } else { 'en' }
             Roles      = [string[]]$roles
             AllServers = [bool]$rbAll.Checked
         }
@@ -3997,8 +3881,8 @@ $btnExport.Add_Click({
             'View'   { Open-ReportsTab }
             'Tab'    { Export-ActiveTabCsv }
             'Report' {
-                Write-Log "Export: $($choice.Format) [$($choice.Language)], roles: $(if ($choice.Roles.Count) { $choice.Roles -join ', ' } else { 'all' }), all servers: $($choice.AllServers)"
-                Invoke-RoleReport -Format $choice.Format -Roles $choice.Roles -AllServers:$choice.AllServers -Language $choice.Language
+                Write-Log "Export: $($choice.Format), roles: $(if ($choice.Roles.Count) { $choice.Roles -join ', ' } else { 'all' }), all servers: $($choice.AllServers)"
+                Invoke-RoleReport -Format $choice.Format -Roles $choice.Roles -AllServers:$choice.AllServers
             }
         }
     }

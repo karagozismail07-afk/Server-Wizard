@@ -13,7 +13,7 @@ Scan every Windows Server in your Active Directory domain over WinRM and browse 
 - **Collected data**: OS + version, install/last restart dates, IPs, CPU/RAM, disks with free-space warnings, roles & features, automatic services, last RDP logons, IIS sites + DNS names + modules + SSL bindings (with certificate dates), listening ports, SQL instance details (edition/version), database services, Microsoft and 3rd-party software with versions, running 3rd-party services
 - **Role-based reporting** (`Export Report` opens one dialog):
   - choose the **roles** (e.g. only IIS, only SQL, or IIS + SQL) and the **servers** (checked in the list or all scanned) that go into the report
-  - **Readable report: HTML, PDF or both** (v1.6), in Turkish or English. It only shows facts (no advice, no scores) and is written for the team, management and auditors alike:
+  - **Readable report: HTML, PDF or both** (v1.6), in English. It only shows facts (no advice, no scores) and is written for the team, management and auditors alike:
     1. Summary: servers, role groups, OS / database versions, support status and certificate expiry as simple bar charts
     2. Lifecycle calendar for the next 12 months (support end, EOL, ESU end, certificate expiry), dates only
     3. Operating systems, databases and IIS with install date, version, support end, EOL, time left, status and the official source of each date
