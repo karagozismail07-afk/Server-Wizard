@@ -120,7 +120,7 @@ try {
     Write-Host "Building ServerWizard.exe..." -ForegroundColor Cyan
     Invoke-ps2exe -InputFile $SourcePs1 -OutputFile $ExePath `
         -NoConsole -STA -IconFile $IconPath `
-        -Title "Server Wizard" -Product "Server Wizard" -Version "1.7.0.0" -ErrorAction Stop
+        -Title "Server Wizard" -Product "Server Wizard" -Version "1.7.1.0" -ErrorAction Stop
     $builtExe = Test-Path $ExePath
 }
 catch {

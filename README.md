@@ -11,9 +11,10 @@ Scan every Windows Server in your Active Directory domain over WinRM and browse 
 - **Per-server tabs**: click a server to open its full inventory in its own closable tab
 - **Search**: type an IP, website, DNS name, port, software or user name and instantly see which server it lives on. Results open with a summary of how many matches were found per category (SSL bindings, IIS websites, DNS names, installed software, services, ports…), then list them grouped by category and server, with matches highlighted. Click a category in the summary to filter to it
 - **Collected data**: OS + version, install/last restart dates, IPs, CPU/RAM, disks with free-space warnings, roles & features, automatic services, last RDP logons, IIS sites + DNS names + modules + SSL bindings (with certificate dates), listening ports, SQL instance details (edition/version), database services, Microsoft and 3rd-party software with versions, running 3rd-party services
-- **Overview (home tab, v1.7)**: opens with the app. Top line: servers, critical / warning counts, OS past end of support, IIS and database counts. Then a **Risks** list (critical first) and a compact **Server profiles** grid (roles, OS, support status, end of support, IIS, databases, next certificate expiry, lowest free disk, uptime). Double-click a row to open the server
-  - *Critical*: OS or database past end of support (no paid ESU), certificate bound to IIS expired or expiring within 14 days, a disk below 10% free, server unreachable at the last scan
-  - *Warning*: OS or database in paid ESU or ending within 12 months, IIS certificate expiring within 60 days, a disk below 20% free
+- **Home dashboard** (v1.7.1): a permanent first tab that cannot be closed and comes back whenever no other tab is open. Risk cards by type show how many servers are affected; click a card to list those servers (double-click a row to open the server)
+  - *Critical*: OS or database past end of support (no paid ESU), IIS certificate expired or expiring within 14 days, a disk below 10% free, unreachable at the last scan
+  - *Warning*: OS in paid ESU or OS / database ending within 12 months, IIS certificate expiring within 60 days, a disk below 20% free
+  - Server names in the tree are no longer coloured; risks live on the dashboard
 - **Report Builder** (v1.7, `Report Builder` button): you choose everything, nothing is pre-selected and a group never adds a filter on its own
   1. *Groups*: one or more role groups (IIS / Web, SQL / Database, ...)
   2. *Columns*: tick exactly the fields you need (e.g. IIS servers + *Lowest free space* + *Disks*), grouped as General, OS lifecycle, Hardware, Disks, IIS, Database, Certificates, Roles and software

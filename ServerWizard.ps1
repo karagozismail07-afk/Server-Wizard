@@ -32,7 +32,7 @@ function Set-DoubleBuffered($ctrl) {
 }
 
 # --- Version ---------------------------------------------------------------
-$script:AppVersion = '1.7'
+$script:AppVersion = '1.7.1'
 
 # --- UI font: Open Sans if installed on this server, else Segoe UI ---------
 $script:FontName = 'Segoe UI'
@@ -82,7 +82,7 @@ public class SwTabControl : TabControl {
     public Color StripBack = Color.FromArgb(30, 31, 34), TabBack = Color.FromArgb(39, 41, 45), TabSel = Color.FromArgb(52, 55, 60);
     public Color Fore = Color.FromArgb(150, 156, 166), ForeSel = Color.FromArgb(222, 224, 228), Accent = Color.FromArgb(96, 146, 245);
     public Color CloseColor = Color.FromArgb(200, 110, 110), Line = Color.FromArgb(64, 67, 73);
-    public string Pinned = "Overview";
+    public string Pinned = "Home";
     public SwTabControl() {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
     }
@@ -1708,14 +1708,8 @@ function Rebuild-Tree([hashtable]$groups) {
             $n         = New-Object System.Windows.Forms.TreeNode ($text)
             $n.Checked = $entry.CheckedState
 
-            $res = $script:Results[$entry.Name]
-            if ($res) {
-                $minFree = 100
-                if ("$($res.MinDiskFree)" -match '^[\d\.]+$') { $minFree = [double]$res.MinDiskFree }
-                if     ($minFree -lt 10) { $n.ForeColor = $script:ThBad }
-                elseif ($minFree -lt 20) { $n.ForeColor = $script:WarnOrange }
-            }
-            else { $n.ForeColor = $script:ThMuted }
+            # Risks are shown on the Home dashboard; only not-yet-scanned servers are dimmed
+            if (-not $script:Results[$entry.Name]) { $n.ForeColor = $script:ThMuted }
             [void]$gNode.Nodes.Add($n)
         }
     }
@@ -2281,9 +2275,10 @@ function Set-DarkTheme($ctrl) {
 }
 
 # ============================================================================
-# Overview tab: risks first, then one compact row per server
+# Home: a permanent risk dashboard (first tab, cannot be closed, shown
+# whenever no other tab is open). Risk cards by type -> affected servers.
 # ============================================================================
-function New-InfoLabel([string]$text, [int]$size = 9, [bool]$bold = $false) {
+function New-InfoLabel([string]$text, [single]$size = 9, [bool]$bold = $false) {
     $l = New-Object System.Windows.Forms.Label
     $l.AutoSize = $true; $l.Text = $text; $l.ForeColor = $script:ThText
     $l.Font = New-Object System.Drawing.Font($script:FontName, $size, $(if ($bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
@@ -2301,13 +2296,14 @@ function New-DarkGrid {
     $g.Add_CellDoubleClick({
         param($s, $e)
         if ($e.RowIndex -lt 0) { return }
-        try { $v = "$($s.Rows[$e.RowIndex].Cells['Server'].Value)"; if ($v) { Open-ServerTab $v } } catch {}
+        try { $v = "$($s.Rows[$e.RowIndex].Cells['Server'].Value)"; if ($v -and $script:Results.ContainsKey($v)) { Open-ServerTab $v } } catch {}
     })
     return $g
 }
 
 function Set-GridRows([System.Windows.Forms.DataGridView]$grid, [string[]]$cols, $rows, [hashtable]$widths) {
     $grid.SuspendLayout()
+    $grid.Rows.Clear()
     $grid.Columns.Clear()
     foreach ($c in $cols) {
         $i = $grid.Columns.Add($c, $c)
@@ -2319,128 +2315,189 @@ function Set-GridRows([System.Windows.Forms.DataGridView]$grid, [string[]]$cols,
         else { $col.Width = 110 }
     }
     foreach ($r in @($rows)) {
-        $vals = foreach ($c in $cols) { "$($r.$c)" }
-        [void]$grid.Rows.Add([object[]]@($vals))
+        $vals = @(foreach ($c in $cols) { "$($r.$c)" })
+        [void]$grid.Rows.Add([object[]]$vals)
     }
     $grid.ResumeLayout()
 }
 
-function Get-ToneColor([string]$text) {
-    if ($text -match '^(Critical|Past end of support$|Expired)') { return $script:ThBad }
-    if ($text -match '^(Warning|Past end of support \(ESU\)|Extended support)') { return $script:ThWarn }
-    if ($text -match '^Supported') { return $script:ThOk }
-    return $null
+# Card definitions: Level + Area of Get-RiskItems
+$script:HomeCards = @(
+    @{ Id = 'C-OS';   Level = 'Critical'; Area = 'OS';          Title = 'OS past end of support' },
+    @{ Id = 'C-DB';   Level = 'Critical'; Area = 'Database';    Title = 'Database past end of support' },
+    @{ Id = 'C-CERT'; Level = 'Critical'; Area = 'Certificate'; Title = 'IIS certificate expired / <= 14 days' },
+    @{ Id = 'C-DISK'; Level = 'Critical'; Area = 'Disk';        Title = 'Disk below 10% free' },
+    @{ Id = 'C-SCAN'; Level = 'Critical'; Area = 'Scan';        Title = 'Unreachable at last scan' },
+    @{ Id = 'W-OS';   Level = 'Warning';  Area = 'OS';          Title = 'OS in ESU / ends within 12 months' },
+    @{ Id = 'W-DB';   Level = 'Warning';  Area = 'Database';    Title = 'Database ends within 12 months' },
+    @{ Id = 'W-CERT'; Level = 'Warning';  Area = 'Certificate'; Title = 'IIS certificate <= 60 days' },
+    @{ Id = 'W-DISK'; Level = 'Warning';  Area = 'Disk';        Title = 'Disk below 20% free' }
+)
+$script:HomeFilter = 'ALL-C'
+$script:HomeRisks  = @()
+
+function New-HomeCard($def) {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Size = New-Object System.Drawing.Size(212, 70)
+    $p.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 8)
+    $p.BackColor = $script:ThPanel
+    $p.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $p.Tag = $def.Id
+    $bar = New-Object System.Windows.Forms.Panel
+    $bar.Dock = 'Left'; $bar.Width = 4; $bar.Tag = $def.Id
+    $num = New-InfoLabel '0' 18 $true
+    $num.Location = New-Object System.Drawing.Point(12, 4); $num.Tag = $def.Id
+    $sub = New-InfoLabel '' 8
+    $sub.ForeColor = $script:ThMuted; $sub.Tag = $def.Id
+    $sub.Location = New-Object System.Drawing.Point(64, 16)
+    $cap = New-InfoLabel $def.Title 8.5
+    $cap.Location = New-Object System.Drawing.Point(12, 44); $cap.Tag = $def.Id
+    $cap.MaximumSize = New-Object System.Drawing.Size(196, 0)
+    $p.Controls.AddRange(@($num, $sub, $cap, $bar))
+    $click = { param($s, $e) $script:HomeFilter = "$($s.Tag)"; Update-HomeList }
+    foreach ($c in @($p, $bar, $num, $sub, $cap)) { $c.Add_Click($click) }
+    return @{ Panel = $p; Bar = $bar; Num = $num; Sub = $sub; Def = $def }
+}
+
+function Update-HomeList {
+    $ui = $script:HomeUi
+    if (-not $ui) { return }
+    $f = $script:HomeFilter
+    $rows = @($script:HomeRisks)
+    $title = 'All risks'
+    if ($f -eq 'ALL-C') { $rows = @($rows | Where-Object { $_.Level -eq 'Critical' }); $title = 'All critical risks' }
+    elseif ($f -ne 'ALL') {
+        $def = $script:HomeCards | Where-Object { $_.Id -eq $f } | Select-Object -First 1
+        if ($def) { $rows = @($rows | Where-Object { $_.Level -eq $def.Level -and $_.Area -eq $def.Area }); $title = "$($def.Level): $($def.Title)" }
+    }
+    $nSrv = @($rows | ForEach-Object { $_.Server } | Sort-Object -Unique).Count
+    $ui.ListTitle.Text = "$title  -  $($rows.Count) item(s) on $nSrv server(s).  Double-click a row to open the server."
+    Set-GridRows $ui.Grid @('Level', 'Server', 'Item', 'Detail', 'Date', 'Roles') $rows @{ Level = 70; Server = 160; Item = 230; Detail = 0; Date = 90; Roles = 200 }
+    foreach ($card in $ui.Cards) {
+        $sel = ($card.Def.Id -eq $f)
+        $card.Panel.BackColor = $(if ($sel) { $script:ThSelect } else { $script:ThPanel })
+    }
+    $ui.LnkCrit.LinkVisited = ($f -eq 'ALL-C'); $ui.LnkAll.LinkVisited = ($f -eq 'ALL')
 }
 
 function Update-Overview {
-    $ui = $script:OverviewUi
+    $ui = $script:HomeUi
     if (-not $ui) { return }
     try {
-        $risks = @(Get-RiskItems)
-        $crit  = @($risks | Where-Object { $_.Level -eq 'Critical' })
-        $warn  = @($risks | Where-Object { $_.Level -eq 'Warning' })
-        $keys  = @($script:Results.Keys | Sort-Object)
-        $osEol = 0; $dbEng = 0; $iisN = 0; $certSoon = 0
-        $profiles = foreach ($k in $keys) {
-            $f = Get-ServerFacts $k
-            if (-not $f) { continue }
-            if ($f.OsStatus -like 'Past*') { $osEol++ }
-            $eng = @($f.Databases | Where-Object { $_.IsEngine })
-            $dbEng += $eng.Count
-            if ($f.Iis) { $iisN++ }
-            $inUse = @($f.Certs | Where-Object { $_.InUse -and $null -ne $_.Days } | Sort-Object Days)
-            if ($inUse.Count -and $inUse[0].Days -le 60) { $certSoon++ }
-            $nRisk = @($risks | Where-Object { $_.Server -eq $k })
-            [PSCustomObject]@{
-                Server        = $k
-                Risks         = $(if ($nRisk.Count) { "$(@($nRisk | Where-Object Level -eq 'Critical').Count) crit / $(@($nRisk | Where-Object Level -eq 'Warning').Count) warn" } else { '' })
-                Roles         = (@($f.Groups) -join ', ')
-                OS            = $f.OsName
-                'OS support'  = $f.OsStatus
-                'End of support' = $(if ($f.OsLc) { Format-Day $f.OsLc.EOL } else { '' })
-                IIS           = $(if ($f.Iis) { "IIS $($f.Iis.Version) ($($f.Iis.SiteCount) sites)" } else { '' })
-                Databases     = ((@($eng | ForEach-Object { $_.Name }) | Sort-Object -Unique) -join ', ')
-                'Next cert expiry' = $(if ($inUse.Count) { "$($inUse[0].Expires) ($($inUse[0].Days) d)" } else { '' })
-                'Min disk free' = $(if ($f.MinDisk) { "$($f.MinDisk.Drive) $($f.MinDisk.FreePct)%" } else { '' })
-                Uptime        = $(if ($null -ne $f.UptimeDays) { "$($f.UptimeDays) d" } else { '' })
-            }
+        $keys = @($script:Results.Keys)
+        if ($keys.Count -eq 0) {
+            $script:HomeRisks = @()
+            $ui.Kpi.Text = 'No inventory yet. Load the servers from AD (left), then run a scan.'
         }
-        $ui.Kpi.Text = "$($keys.Count) servers    |    Critical: $($crit.Count)    Warning: $($warn.Count)    |    OS past end of support: $osEol    |    IIS: $iisN    Database engines: $dbEng    |    Certificates in use expiring <= 60 days: $certSoon"
-        $ui.RiskTitle.Text = if ($risks.Count) { "Risks ($($crit.Count) critical, $($warn.Count) warning) - double-click to open the server" } else { 'Risks: none found' }
-        Set-GridRows $ui.Risks @('Level', 'Server', 'Area', 'Item', 'Detail', 'Date') $risks @{ Level = 70; Server = 150; Area = 85; Item = 220; Detail = 0; Date = 85 }
-        Set-GridRows $ui.Profiles @('Server', 'Risks', 'Roles', 'OS', 'OS support', 'End of support', 'IIS', 'Databases', 'Next cert expiry', 'Min disk free', 'Uptime') @($profiles) @{ Server = 150; Risks = 95; Roles = 0; OS = 210; 'OS support' = 140; 'End of support' = 95; IIS = 120; Databases = 160; 'Next cert expiry' = 120; 'Min disk free' = 90; Uptime = 60 }
+        else {
+            $risks = @(Get-RiskItems)
+            foreach ($x in $risks) {
+                $roles = if ($script:Results.ContainsKey($x.Server)) { @(Get-EffectiveGroups $x.Server $script:Results[$x.Server]) -join ', ' } else { '' }
+                $x | Add-Member -NotePropertyName Roles -NotePropertyValue $roles -Force
+            }
+            $script:HomeRisks = $risks
+            $crit = @($risks | Where-Object { $_.Level -eq 'Critical' })
+            $warn = @($risks | Where-Object { $_.Level -eq 'Warning' })
+            $srvC = @($crit | ForEach-Object { $_.Server } | Sort-Object -Unique).Count
+            $srvW = @($warn | ForEach-Object { $_.Server } | Sort-Object -Unique).Count
+            $ui.Kpi.Text = "$($keys.Count) servers in inventory   |   $srvC with critical risks   |   $srvW with warnings"
+        }
+        foreach ($card in $ui.Cards) {
+            $d = $card.Def
+            $items = @($script:HomeRisks | Where-Object { $_.Level -eq $d.Level -and $_.Area -eq $d.Area })
+            $nS = @($items | ForEach-Object { $_.Server } | Sort-Object -Unique).Count
+            $card.Num.Text = "$nS"
+            $card.Sub.Text = if ($nS -eq 1) { 'server' } else { 'servers' }
+            $card.Sub.Left = $card.Num.Right + 2
+            $tone = if ($nS -eq 0) { $script:ThLine } elseif ($d.Level -eq 'Critical') { $script:ThBad } else { $script:ThWarn }
+            $card.Bar.BackColor = $tone
+            $card.Num.ForeColor = $(if ($nS -eq 0) { $script:ThMuted } else { $tone })
+        }
         $when = if ($script:LifecycleRefreshed) { $script:LifecycleRefreshed.ToString('yyyy-MM-dd HH:mm') } else { 'not yet checked' }
-        $ui.Foot.Text = "Support dates: official vendor pages, checked $when. Critical = past end of support, in-use certificate expired or <= 14 days, disk < 10% free, unreachable. Warning = paid ESU or end of support <= 12 months, in-use certificate <= 60 days, disk < 20% free."
+        $ui.Foot.Text = "Support dates: official vendor pages, checked $when.   Click a card to list its servers."
+        Update-HomeList
     }
     catch {
-        Write-Log "OVERVIEW FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
-        $ui.Kpi.Text = "Overview could not be built: $($_.Exception.Message) (see log)"
+        Write-Log "HOME FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        $ui.Kpi.Text = "Home could not be built: $($_.Exception.Message) (see log)"
     }
 }
 
 function Show-Overview([bool]$select = $true) {
-    if (-not $script:OverviewUi) {
-        $tp = New-Object System.Windows.Forms.TabPage ('Overview')
-        $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $script:ThBg
-        $root = New-Object System.Windows.Forms.TableLayoutPanel
-        $root.Dock = 'Fill'; $root.ColumnCount = 1; $root.RowCount = 5; $root.BackColor = $script:ThBg
-        $root.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 4)
-        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
-        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
-        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 38)))
-        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 62)))
-        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
+    try {
+        if (-not $script:HomeUi) {
+            $tp = New-Object System.Windows.Forms.TabPage ('Home')
+            $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $script:ThBg
+            $root = New-Object System.Windows.Forms.TableLayoutPanel
+            $root.Dock = 'Fill'; $root.ColumnCount = 1; $root.RowCount = 8; $root.BackColor = $script:ThBg
+            $root.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 6)
+            foreach ($i in 1..6) { [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
+            [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+            [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 
-        $kpi = New-InfoLabel '' 9.5 $true
-        $kpi.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 6)
-        $riskTitle = New-InfoLabel 'Risks' 9 $true
-        $riskTitle.ForeColor = $script:ThAccent
-        $risks = New-DarkGrid
-        $risks.Add_CellFormatting({
-            param($s, $e)
-            try {
-                if ($s.Columns[$e.ColumnIndex].Name -eq 'Level') {
-                    $c = Get-ToneColor "$($e.Value)"
-                    if ($c) { $e.CellStyle.ForeColor = $c; $e.CellStyle.Font = New-Object System.Drawing.Font($script:FontName, 8.75, [System.Drawing.FontStyle]::Bold) }
-                }
-            } catch {}
-        })
-        $profTitle = New-InfoLabel 'Server profiles' 9 $true
-        $profTitle.ForeColor = $script:ThAccent
-        $profiles = New-DarkGrid
-        $profiles.Add_CellFormatting({
-            param($s, $e)
-            try {
-                $n = $s.Columns[$e.ColumnIndex].Name
-                if ($n -eq 'OS support') { $c = Get-ToneColor "$($e.Value)"; if ($c) { $e.CellStyle.ForeColor = $c } }
-                elseif ($n -eq 'Risks' -and "$($e.Value)" -match '^[1-9]') { $e.CellStyle.ForeColor = $script:ThBad }
-                elseif ($n -eq 'Min disk free' -and "$($e.Value)" -match '\s([\d\.]+)%') {
-                    $p = [double]$matches[1]
-                    if ($p -lt 10) { $e.CellStyle.ForeColor = $script:ThBad } elseif ($p -lt 20) { $e.CellStyle.ForeColor = $script:ThWarn }
-                }
-            } catch {}
-        })
-        $pRisk = New-Object System.Windows.Forms.Panel
-        $pRisk.Dock = 'Fill'; $pRisk.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
-        $riskTitle.Dock = 'Top'; $pRisk.Controls.Add($risks); $pRisk.Controls.Add($riskTitle)
-        $pProf = New-Object System.Windows.Forms.Panel
-        $pProf.Dock = 'Fill'
-        $profTitle.Dock = 'Top'; $pProf.Controls.Add($profiles); $pProf.Controls.Add($profTitle)
-        $foot = New-InfoLabel '' 8
-        $foot.ForeColor = $script:ThMuted
-        $foot.MaximumSize = New-Object System.Drawing.Size(1400, 0)
+            $kpi = New-InfoLabel '' 10 $true
+            $kpi.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+            $mkHead = { param($t, $c) $l = New-InfoLabel $t 9 $true; $l.ForeColor = $c; $l.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 4); $l }
+            $hCrit = & $mkHead 'CRITICAL' $script:ThBad
+            $hWarn = & $mkHead 'WARNING' $script:ThWarn
+            $mkFlow = {
+                $fl = New-Object System.Windows.Forms.FlowLayoutPanel
+                $fl.AutoSize = $true; $fl.AutoSizeMode = 'GrowAndShrink'; $fl.WrapContents = $true
+                $fl.Dock = 'Fill'; $fl.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4); $fl.BackColor = $script:ThBg
+                $fl
+            }
+            $flC = & $mkFlow; $flW = & $mkFlow
+            $cards = @()
+            foreach ($d in $script:HomeCards) {
+                $c = New-HomeCard $d
+                if ($d.Level -eq 'Critical') { $flC.Controls.Add($c.Panel) } else { $flW.Controls.Add($c.Panel) }
+                $cards += $c
+            }
+            # List header: title + quick links
+            $pHead = New-Object System.Windows.Forms.FlowLayoutPanel
+            $pHead.AutoSize = $true; $pHead.WrapContents = $false; $pHead.Dock = 'Fill'; $pHead.BackColor = $script:ThBg
+            $pHead.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 4)
+            $listTitle = New-InfoLabel '' 9 $true
+            $listTitle.ForeColor = $script:ThAccent
+            $lnkCrit = New-Object System.Windows.Forms.LinkLabel
+            $lnkCrit.Text = 'All critical'; $lnkCrit.AutoSize = $true; $lnkCrit.Margin = New-Object System.Windows.Forms.Padding(18, 1, 0, 0)
+            $lnkAll = New-Object System.Windows.Forms.LinkLabel
+            $lnkAll.Text = 'All risks'; $lnkAll.AutoSize = $true; $lnkAll.Margin = New-Object System.Windows.Forms.Padding(10, 1, 0, 0)
+            foreach ($l in @($lnkCrit, $lnkAll)) { $l.LinkColor = $script:ThAccent; $l.VisitedLinkColor = $script:ThText; $l.ActiveLinkColor = $script:ThText }
+            $lnkCrit.Add_LinkClicked({ $script:HomeFilter = 'ALL-C'; Update-HomeList })
+            $lnkAll.Add_LinkClicked({ $script:HomeFilter = 'ALL'; Update-HomeList })
+            $pHead.Controls.AddRange(@($listTitle, $lnkCrit, $lnkAll))
 
-        $root.Controls.Add($kpi, 0, 0)
-        $root.Controls.Add((New-InfoLabel '' 2), 0, 1)
-        $root.Controls.Add($pRisk, 0, 2)
-        $root.Controls.Add($pProf, 0, 3)
-        $root.Controls.Add($foot, 0, 4)
-        $tp.Controls.Add($root)
-        $tabs.TabPages.Insert(0, $tp)
-        $script:OverviewUi = @{ Tab = $tp; Kpi = $kpi; RiskTitle = $riskTitle; Risks = $risks; Profiles = $profiles; Foot = $foot }
+            $grid = New-DarkGrid
+            $grid.Add_CellFormatting({
+                param($s, $e)
+                try {
+                    if ($s.Columns[$e.ColumnIndex].Name -eq 'Level') {
+                        $e.CellStyle.ForeColor = $(if ("$($e.Value)" -eq 'Critical') { $script:ThBad } else { $script:ThWarn })
+                    }
+                } catch {}
+            })
+            $foot = New-InfoLabel '' 8
+            $foot.ForeColor = $script:ThMuted
+            $foot.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
+
+            $root.Controls.Add($kpi, 0, 0)
+            $root.Controls.Add($hCrit, 0, 1)
+            $root.Controls.Add($flC, 0, 2)
+            $root.Controls.Add($hWarn, 0, 3)
+            $root.Controls.Add($flW, 0, 4)
+            $root.Controls.Add($pHead, 0, 5)
+            $root.Controls.Add($grid, 0, 6)
+            $root.Controls.Add($foot, 0, 7)
+            $tp.Controls.Add($root)
+            $tabs.TabPages.Insert(0, $tp)
+            $script:HomeUi = @{ Tab = $tp; Kpi = $kpi; Cards = $cards; Grid = $grid; ListTitle = $listTitle; LnkCrit = $lnkCrit; LnkAll = $lnkAll; Foot = $foot }
+        }
+        elseif (-not $tabs.TabPages.Contains($script:HomeUi.Tab)) { $tabs.TabPages.Insert(0, $script:HomeUi.Tab) }
+        Update-Overview
+        if ($select) { $tabs.SelectedTab = $script:HomeUi.Tab }
     }
-    Update-Overview
-    if ($select) { $tabs.SelectedTab = $script:OverviewUi.Tab }
+    catch { Write-Log "HOME TAB FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)" }
 }
 
 # ============================================================================
@@ -3056,7 +3113,7 @@ $tabs.Add_DrawItem({
     $textBrush.Dispose(); $font.Dispose()
 
     # x button (Overview stays)
-    if ($tabs.TabPages[$e.Index].Text -eq 'Overview') { return }
+    if ($tabs.TabPages[$e.Index].Text -eq 'Home') { return }
     $xBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 60, 60))
     $xFont  = New-Object System.Drawing.Font($script:FontName, 8, [System.Drawing.FontStyle]::Bold)
     $g.DrawString("x", $xFont, $xBrush, ([single]($rect.Right - 16)), ([single]($rect.Y + 4)))
@@ -3068,8 +3125,10 @@ $tabs.Add_MouseDown({
     for ($i = 0; $i -lt $tabs.TabPages.Count; $i++) {
         $r = $tabs.GetTabRect($i)
         $xRect = New-Object System.Drawing.Rectangle (($r.Right - 18), ($r.Top + 2), 16, 16)
-        if ($xRect.Contains($e.Location) -and $tabs.TabPages[$i].Text -ne 'Overview') {
+        if ($xRect.Contains($e.Location) -and $tabs.TabPages[$i].Text -ne 'Home') {
             $tabs.TabPages.RemoveAt($i)
+            # Nothing else open -> the Home dashboard
+            if ($tabs.TabPages.Count -le 1) { Show-Overview }
             break
         }
     }
@@ -3250,6 +3309,7 @@ if (Load-Cache) {
     Set-Status "Loaded $($script:Results.Keys.Count) servers from cache ($cacheDate). Click a server to open it in a tab." $script:OkGreen
 }
 else {
+    Show-Overview
     Set-Status "Ready. Load the server list from AD, then run a scan."
 }
 Update-LastScanLabel
