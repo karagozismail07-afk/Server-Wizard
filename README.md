@@ -9,22 +9,20 @@ Scan every Windows Server in your Active Directory domain over WinRM and browse 
 - **AD-based discovery**: pulls only real, enabled Windows Server objects (cluster virtual objects filtered out), with optional parallel ping check
 - **Role grouping (multi-role)**: every installed Windows Server role and role service is read during the scan and servers are classified automatically (Domain Controllers, SQL / Database, IIS / Web, DNS, DHCP, Certificate Services, ADFS, RDS, Hyper-V, File Services / DFS, Print, WSUS, WDS, NPS / Remote Access, Failover Cluster, Exchange, 3rd Party). A server with several roles appears in **every** matching list; checking it in one list checks all its copies. Right-click pins a server to a single group (persisted)
 - **Per-server tabs**: click a server to open its full inventory in its own closable tab
-- **Categorised search**: type an IP, website, DNS name, port, software or user name and instantly see which server it lives on. Results open with a summary of how many matches were found per category (SSL bindings, IIS websites, DNS names, installed software, services, ports…), then list them grouped by category and server, with matches highlighted. Narrow a search to a single category from the dropdown, or click a category in the summary to filter to it
+- **Search**: type an IP, website, DNS name, port, software or user name and instantly see which server it lives on. Results open with a summary of how many matches were found per category (SSL bindings, IIS websites, DNS names, installed software, services, ports…), then list them grouped by category and server, with matches highlighted. Click a category in the summary to filter to it
 - **Collected data**: OS + version, install/last restart dates, IPs, CPU/RAM, disks with free-space warnings, roles & features, automatic services, last RDP logons, IIS sites + DNS names + modules + SSL bindings (with certificate dates), listening ports, SQL instance details (edition/version), database services, Microsoft and 3rd-party software with versions, running 3rd-party services
-- **Role-based reporting** (`Export Report` opens one dialog):
-  - choose the **roles** (e.g. only IIS, only SQL, or IIS + SQL) and the **servers** (checked in the list or all scanned) that go into the report
-  - **Readable report: HTML, PDF or both** (v1.6), in English. It only shows facts (no advice, no scores) and is written for the team, management and auditors alike:
-    1. Summary: servers, role groups, OS / database versions, support status and certificate expiry as simple bar charts
-    2. Lifecycle calendar for the next 12 months (support end, EOL, ESU end, certificate expiry), dates only
-    3. Operating systems, databases and IIS with install date, version, support end, EOL, time left, status and the official source of each date
-    4. Role views, certificates (with "In use" = IIS binding), one card per server
-    5. Appendix: method notes, every official source with its retrieval time (offline copies marked) and the classification evidence
-  - The HTML file works offline: role chips, a neutral "only dates passed or within 90 days" filter, search, sortable columns and a Print / PDF button. The PDF (A4 landscape) is printed by the local Microsoft Edge or Google Chrome in headless mode; nothing leaves the machine
-  - Scope chosen in the dialog: roles to include and servers (checked or all scanned); the scope and the user who generated it are printed on the report
-  - **Active tab only (CSV)**: the v1.4 per-server / search-result export
-  - **Open in-app view**: a `Reports` tab with a section selector, a sortable, colour-coded grid (double-click a row to open the server) and export / refresh buttons
+- **Overview (home tab, v1.7)**: opens with the app. Top line: servers, critical / warning counts, OS past end of support, IIS and database counts. Then a **Risks** list (critical first) and a compact **Server profiles** grid (roles, OS, support status, end of support, IIS, databases, next certificate expiry, lowest free disk, uptime). Double-click a row to open the server
+  - *Critical*: OS or database past end of support (no paid ESU), certificate bound to IIS expired or expiring within 14 days, a disk below 10% free, server unreachable at the last scan
+  - *Warning*: OS or database in paid ESU or ending within 12 months, IIS certificate expiring within 60 days, a disk below 20% free
+- **Report Builder** (v1.7, `Report Builder` button): you choose everything, nothing is pre-selected and a group never adds a filter on its own
+  1. *Groups*: one or more role groups (IIS / Web, SQL / Database, ...)
+  2. *Columns*: tick exactly the fields you need (e.g. IIS servers + *Lowest free space* + *Disks*), grouped as General, OS lifecycle, Hardware, Disks, IIS, Database, Certificates, Roles and software
+  3. *Conditions* (optional): disk below 20% / 10%, OS or database past end of support, OS ending within 12 months, certificate in use expiring within 30 / 90 days, has IIS / database, not restarted for 30+ days; match all or any
+  - Servers checked in the list or all scanned; one table per group or one table with a Groups column; HTML, PDF (A4 landscape via the local Edge / Chrome) or both; your last choices are remembered
+  - The report shows only the ticked columns plus generation time, user, groups, columns and conditions. *Export the active tab as CSV* is still available from the same dialog
+- **Dark theme and compact layout** (v1.7): dark window, title bar, tabs and grids; one line per field in server tabs
 - **Role classification evidence**: every placement shows why (Windows role, database engine with its instance, or service), in the server tab and in the report's *Role Classification* section. Database packages without a service (client tools, drivers) are listed but do not make a server a database server
-- **Role details in reports and server tabs**:
+- **Role details in server tabs and the Report Builder**:
   - *Operating system*: version, build, install date, Microsoft Lifecycle policy, mainstream end, extended end (EOL), paid ESU end, days to EOL, status
   - *Databases*: product (Microsoft SQL Server, MariaDB, MySQL, PostgreSQL, Firebird, MongoDB, Oracle, Redis), version, edition / instance, service pack, install date, service state, vendor support end / EOL
   - *IIS*: version (InetStp), approximate install date, sites, lifecycle (IIS follows the Windows lifecycle)

@@ -32,7 +32,7 @@ function Set-DoubleBuffered($ctrl) {
 }
 
 # --- Version ---------------------------------------------------------------
-$script:AppVersion = '1.6.1'
+$script:AppVersion = '1.7'
 
 # --- UI font: Open Sans if installed on this server, else Segoe UI ---------
 $script:FontName = 'Segoe UI'
@@ -41,12 +41,77 @@ try {
     if ($installed -contains 'Open Sans') { $script:FontName = 'Open Sans' }
 } catch {}
 
-# --- Theme -----------------------------------------------------------------
-$script:MerlinBlue   = [System.Drawing.Color]::FromArgb(31, 58, 147)
-$script:MerlinBlueLt = [System.Drawing.Color]::FromArgb(232, 238, 252)
-$script:MerlinYellow = [System.Drawing.Color]::FromArgb(250, 204, 21)
-$script:WarnOrange   = [System.Drawing.Color]::FromArgb(200, 100, 0)
-$script:OkGreen      = [System.Drawing.Color]::FromArgb(0, 120, 60)
+# --- Theme (dark) ------------------------------------------------------------
+function New-Rgb([int]$r, [int]$g, [int]$b) { return [System.Drawing.Color]::FromArgb($r, $g, $b) }
+$script:ThBg      = New-Rgb 30 31 34      # window / content
+$script:ThPanel   = New-Rgb 39 41 45      # side panel, headers
+$script:ThSurface = New-Rgb 52 55 60      # inputs, buttons
+$script:ThAlt     = New-Rgb 35 36 40      # alternating grid rows
+$script:ThLine    = New-Rgb 64 67 73
+$script:ThSelect  = New-Rgb 45 70 120
+$script:ThText    = New-Rgb 222 224 228
+$script:ThMuted   = New-Rgb 150 156 166
+$script:ThAccent  = New-Rgb 96 146 245
+$script:ThOk      = New-Rgb 76 194 128
+$script:ThWarn    = New-Rgb 242 170 60
+$script:ThBad     = New-Rgb 240 90 90
+# Names used throughout the UI code (kept for compatibility)
+$script:MerlinBlue   = $script:ThAccent
+$script:MerlinBlueLt = $script:ThPanel
+$script:MerlinYellow = $script:ThSurface
+$script:WarnOrange   = $script:ThWarn
+$script:OkGreen      = $script:ThOk
+
+# Native helpers: dark title bar / scrollbars (Windows 10 1809+) and a tab
+# control that paints its whole strip (the stock one leaves it light grey).
+# If compiling fails the app falls back to the stock controls.
+$script:DarkNative = $false
+try {
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public static class SwDark {
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int a, ref int v, int s);
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] static extern int SetWindowTheme(IntPtr h, string app, string id);
+    public static void TitleBar(IntPtr h) { int on = 1; if (DwmSetWindowAttribute(h, 20, ref on, 4) != 0) DwmSetWindowAttribute(h, 19, ref on, 4); }
+    public static void Scrollbars(IntPtr h) { SetWindowTheme(h, "DarkMode_Explorer", null); }
+}
+public class SwTabControl : TabControl {
+    public Color StripBack = Color.FromArgb(30, 31, 34), TabBack = Color.FromArgb(39, 41, 45), TabSel = Color.FromArgb(52, 55, 60);
+    public Color Fore = Color.FromArgb(150, 156, 166), ForeSel = Color.FromArgb(222, 224, 228), Accent = Color.FromArgb(96, 146, 245);
+    public Color CloseColor = Color.FromArgb(200, 110, 110), Line = Color.FromArgb(64, 67, 73);
+    public string Pinned = "Overview";
+    public SwTabControl() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+    public bool IsClosable(int i) { return i >= 0 && i < TabCount && TabPages[i].Text != Pinned; }
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.Clear(StripBack);
+        if (SelectedTab != null) {
+            Rectangle d = DisplayRectangle; d.Inflate(1, 1);
+            using (Pen p = new Pen(Line)) g.DrawRectangle(p, d);
+        }
+        for (int i = 0; i < TabCount; i++) {
+            Rectangle r = GetTabRect(i);
+            bool sel = (i == SelectedIndex);
+            using (SolidBrush b = new SolidBrush(sel ? TabSel : TabBack)) g.FillRectangle(b, r);
+            if (sel) using (SolidBrush a = new SolidBrush(Accent)) g.FillRectangle(a, r.Left, r.Bottom - 2, r.Width, 2);
+            int w = IsClosable(i) ? r.Width - 22 : r.Width - 8;
+            TextRenderer.DrawText(g, TabPages[i].Text, Font, new Rectangle(r.X + 6, r.Y, w, r.Height), sel ? ForeSel : Fore,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            if (IsClosable(i))
+                TextRenderer.DrawText(g, "x", Font, new Rectangle(r.Right - 18, r.Y, 14, r.Height), CloseColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+    }
+}
+'@
+    $script:DarkNative = $true
+} catch { $script:DarkNativeError = $_.Exception.Message }
+
 
 # --- Cache / override files (PER USER, so every account can use the app) ---
 if (Test-Path 'D:\') { $script:CacheDir = "D:\Server Wizard\Cache\$env:USERNAME" }
@@ -637,6 +702,7 @@ $script:Overrides    = @{}    # UPPERCASE name -> manually chosen group
 $script:TreeUpdating = $false
 $script:CtxTarget    = $null
 $script:AllCategories   = 'All categories'
+$script:SearchScope     = $script:AllCategories
 $script:LastSearchQuery = ''
 $script:LastSearchRows  = @()
 
@@ -1279,7 +1345,7 @@ function New-WizardBitmap([int]$size) {
     $g.ScaleTransform(($size / 64.0), ($size / 64.0))
 
     $blue   = New-Object System.Drawing.SolidBrush ($script:MerlinBlue)
-    $yellow = New-Object System.Drawing.SolidBrush ($script:MerlinYellow)
+    $yellow = New-Object System.Drawing.SolidBrush ((New-Rgb 250 204 21))
     $skin   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(247, 200, 180))
     $beard  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(238, 232, 222))
     $nose   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(240, 150, 140))
@@ -1318,7 +1384,7 @@ $form.Text          = "Server Wizard v$($script:AppVersion)"
 $form.Size          = New-Object System.Drawing.Size(1280, 820)
 $form.StartPosition = "CenterScreen"
 $form.MinimumSize   = New-Object System.Drawing.Size(1050, 660)
-$form.BackColor     = [System.Drawing.Color]::White
+$form.BackColor     = $script:ThBg
 
 try {
     $form.Icon = [System.Drawing.Icon]::FromHandle((New-WizardBitmap 32).GetHicon())
@@ -1331,27 +1397,27 @@ $form.Font = New-Object System.Drawing.Font($script:FontName, 9)
 # get measured against the default 200px panel width)
 $pnlHeader           = New-Object System.Windows.Forms.Panel
 $pnlHeader.Dock      = "Top"
-$pnlHeader.Size      = New-Object System.Drawing.Size(1264, 84)
+$pnlHeader.Size      = New-Object System.Drawing.Size(1264, 54)
 $pnlHeader.BackColor = $script:MerlinBlueLt
 
 $picLogo          = New-Object System.Windows.Forms.PictureBox
-$picLogo.Location = New-Object System.Drawing.Point(12, 10)
-$picLogo.Size     = New-Object System.Drawing.Size(64, 64)
+$picLogo.Location = New-Object System.Drawing.Point(10, 7)
+$picLogo.Size     = New-Object System.Drawing.Size(40, 40)
 $picLogo.SizeMode = "Zoom"
 $picLogo.Image    = New-WizardBitmap 64
 
 $lblTitle           = New-Object System.Windows.Forms.Label
 $lblTitle.Text      = "Server Wizard"
-$lblTitle.Font      = New-Object System.Drawing.Font("Comic Sans MS", 22, [System.Drawing.FontStyle]::Bold)
+$lblTitle.Font      = New-Object System.Drawing.Font("Comic Sans MS", 15, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor = $script:MerlinBlue
-$lblTitle.Location  = New-Object System.Drawing.Point(84, 8)
+$lblTitle.Location  = New-Object System.Drawing.Point(56, 5)
 $lblTitle.AutoSize  = $true
 
 $lblSubtitle           = New-Object System.Windows.Forms.Label
 $lblSubtitle.Text      = "Windows Server Inventory  -  v$($script:AppVersion)"
 $lblSubtitle.Font      = New-Object System.Drawing.Font($script:FontName, 9)
-$lblSubtitle.ForeColor = [System.Drawing.Color]::DimGray
-$lblSubtitle.Location  = New-Object System.Drawing.Point(90, 56)
+$lblSubtitle.ForeColor = $script:ThMuted
+$lblSubtitle.Location  = New-Object System.Drawing.Point(232, 18)
 $lblSubtitle.AutoSize  = $true
 
 $btnClearCache           = New-Object System.Windows.Forms.Button
@@ -1370,8 +1436,8 @@ $pnlHeader.Controls.AddRange(@($picLogo, $lblTitle, $lblSubtitle, $btnOpenLog, $
 
 # Position header buttons relative to the actual panel width
 $pnlHeader.Add_Resize({
-    $btnClearCache.Top  = 28
-    $btnOpenLog.Top     = 28
+    $btnClearCache.Top  = 13
+    $btnOpenLog.Top     = 13
     $btnClearCache.Left = $pnlHeader.Width - $btnClearCache.Width - 14
     $btnOpenLog.Left    = $btnClearCache.Left - $btnOpenLog.Width - 8
 })
@@ -1380,13 +1446,13 @@ $pnlHeader.Add_Resize({
 $grpSource           = New-Object System.Windows.Forms.GroupBox
 $grpSource.Text      = "Servers"
 $grpSource.ForeColor = $script:MerlinBlue
-$grpSource.Location  = New-Object System.Drawing.Point(10, 94)
-$grpSource.Size      = New-Object System.Drawing.Size(340, 650)
+$grpSource.Location  = New-Object System.Drawing.Point(8, 60)
+$grpSource.Size      = New-Object System.Drawing.Size(320, 686)
 $grpSource.Anchor    = "Top,Bottom,Left"
 
 $lblOU           = New-Object System.Windows.Forms.Label
 $lblOU.Text      = "OU / SearchBase (optional):"
-$lblOU.ForeColor = [System.Drawing.Color]::Black
+$lblOU.ForeColor = $script:ThText
 $lblOU.Location  = New-Object System.Drawing.Point(10, 22)
 $lblOU.AutoSize  = $true
 
@@ -1397,7 +1463,7 @@ $txtOU.Anchor   = "Top,Left,Right"
 
 $chkPing           = New-Object System.Windows.Forms.CheckBox
 $chkPing.Text      = "Ping check (add only reachable servers)"
-$chkPing.ForeColor = [System.Drawing.Color]::Black
+$chkPing.ForeColor = $script:ThText
 $chkPing.Location  = New-Object System.Drawing.Point(10, 68)
 $chkPing.AutoSize  = $true
 $chkPing.Checked   = $true
@@ -1412,7 +1478,7 @@ $btnLoadAD.FlatStyle = "Flat"
 
 $chkAll           = New-Object System.Windows.Forms.CheckBox
 $chkAll.Text      = "Select / deselect all"
-$chkAll.ForeColor = [System.Drawing.Color]::Black
+$chkAll.ForeColor = $script:ThText
 $chkAll.Location  = New-Object System.Drawing.Point(180, 98)
 $chkAll.AutoSize  = $true
 $chkAll.Checked   = $true
@@ -1427,7 +1493,7 @@ $tree.Font          = New-Object System.Drawing.Font($script:FontName, 9)
 
 $lblCount           = New-Object System.Windows.Forms.Label
 $lblCount.Text      = "0 servers  |  Right-click a server to change its group"
-$lblCount.ForeColor = [System.Drawing.Color]::Black
+$lblCount.ForeColor = $script:ThText
 $lblCount.Location  = New-Object System.Drawing.Point(10, 620)
 $lblCount.AutoSize  = $true
 $lblCount.Anchor    = "Bottom,Left"
@@ -1457,35 +1523,35 @@ function Update-SourceLayout {
 # Right side: buttons row
 $btnScan           = New-Object System.Windows.Forms.Button
 $btnScan.Text      = "Start Scan"
-$btnScan.Location  = New-Object System.Drawing.Point(360, 100)
-$btnScan.Size      = New-Object System.Drawing.Size(120, 33)
+$btnScan.Location  = New-Object System.Drawing.Point(336, 64)
+$btnScan.Size      = New-Object System.Drawing.Size(110, 28)
 $btnScan.BackColor = $script:MerlinBlue
 $btnScan.ForeColor = [System.Drawing.Color]::White
 $btnScan.FlatStyle = "Flat"
 
 $btnStop           = New-Object System.Windows.Forms.Button
 $btnStop.Text      = "Stop"
-$btnStop.Location  = New-Object System.Drawing.Point(486, 100)
-$btnStop.Size      = New-Object System.Drawing.Size(70, 33)
+$btnStop.Location  = New-Object System.Drawing.Point(452, 64)
+$btnStop.Size      = New-Object System.Drawing.Size(64, 28)
 $btnStop.Enabled   = $false
 $btnStop.FlatStyle = "Flat"
 
 $btnExport           = New-Object System.Windows.Forms.Button
-$btnExport.Text      = "Export Report"
-$btnExport.Location  = New-Object System.Drawing.Point(562, 100)
-$btnExport.Size      = New-Object System.Drawing.Size(110, 33)
+$btnExport.Text      = "Report Builder"
+$btnExport.Location  = New-Object System.Drawing.Point(522, 64)
+$btnExport.Size      = New-Object System.Drawing.Size(120, 28)
 $btnExport.Enabled   = $false
-$btnExport.BackColor = $script:MerlinYellow
-$btnExport.ForeColor = $script:MerlinBlue
+$btnExport.BackColor = $script:ThSurface
+$btnExport.ForeColor = $script:ThText
 $btnExport.FlatStyle = "Flat"
 
 $lblThrottle          = New-Object System.Windows.Forms.Label
 $lblThrottle.Text     = "Parallel:"
-$lblThrottle.Location = New-Object System.Drawing.Point(682, 108)
+$lblThrottle.Location = New-Object System.Drawing.Point(652, 70)
 $lblThrottle.AutoSize = $true
 
 $numThrottle          = New-Object System.Windows.Forms.NumericUpDown
-$numThrottle.Location = New-Object System.Drawing.Point(738, 105)
+$numThrottle.Location = New-Object System.Drawing.Point(706, 67)
 $numThrottle.Size     = New-Object System.Drawing.Size(52, 23)
 $numThrottle.Minimum  = 1
 $numThrottle.Maximum  = 100
@@ -1494,45 +1560,25 @@ $numThrottle.Value    = 20
 # Search bar (IP / website / DNS -> which server?) with a category scope
 $lblSearch          = New-Object System.Windows.Forms.Label
 $lblSearch.Text     = "Search:"
-$lblSearch.Location = New-Object System.Drawing.Point(360, 142)
+$lblSearch.Location = New-Object System.Drawing.Point(772, 70)
 $lblSearch.AutoSize = $true
 
 $txtSearch          = New-Object System.Windows.Forms.TextBox
-$txtSearch.Location = New-Object System.Drawing.Point(415, 139)
-$txtSearch.Size     = New-Object System.Drawing.Size(300, 23)
-
-$lblScope          = New-Object System.Windows.Forms.Label
-$lblScope.Text     = "in:"
-$lblScope.Location = New-Object System.Drawing.Point(725, 142)
-$lblScope.AutoSize = $true
-
-$cmbScope               = New-Object System.Windows.Forms.ComboBox
-$cmbScope.Location      = New-Object System.Drawing.Point(748, 139)
-$cmbScope.Size          = New-Object System.Drawing.Size(250, 23)
-$cmbScope.DropDownStyle = "DropDownList"
-[void]$cmbScope.Items.Add($script:AllCategories)
-[void]$cmbScope.Items.Add('Server Name')
-foreach ($def in $script:FieldDefs) { [void]$cmbScope.Items.Add($def.Label) }
-$cmbScope.SelectedIndex = 0
+$txtSearch.Location = New-Object System.Drawing.Point(822, 67)
+$txtSearch.Size     = New-Object System.Drawing.Size(280, 23)
 
 $btnSearch           = New-Object System.Windows.Forms.Button
 $btnSearch.Text      = "Find"
-$btnSearch.Location  = New-Object System.Drawing.Point(1006, 137)
-$btnSearch.Size      = New-Object System.Drawing.Size(70, 27)
+$btnSearch.Location  = New-Object System.Drawing.Point(1108, 65)
+$btnSearch.Size      = New-Object System.Drawing.Size(60, 27)
 $btnSearch.BackColor = $script:MerlinBlue
 $btnSearch.ForeColor = [System.Drawing.Color]::White
 $btnSearch.FlatStyle = "Flat"
 
-$lblTabHint           = New-Object System.Windows.Forms.Label
-$lblTabHint.Text      = "Click the x on a tab to close it"
-$lblTabHint.ForeColor = [System.Drawing.Color]::Gray
-$lblTabHint.Location  = New-Object System.Drawing.Point(1086, 142)
-$lblTabHint.AutoSize  = $true
-
 # Tabs: each clicked server opens in its own tab (owner-drawn for the x button)
-$tabs          = New-Object System.Windows.Forms.TabControl
-$tabs.Location = New-Object System.Drawing.Point(360, 170)
-$tabs.Size     = New-Object System.Drawing.Size(895, 574)
+$tabs          = if ($script:DarkNative) { New-Object SwTabControl } else { New-Object System.Windows.Forms.TabControl }
+$tabs.Location = New-Object System.Drawing.Point(336, 100)
+$tabs.Size     = New-Object System.Drawing.Size(920, 646)
 $tabs.Anchor   = "Top,Bottom,Left,Right"
 $tabs.DrawMode = "OwnerDrawFixed"
 $tabs.Padding  = New-Object System.Drawing.Point(18, 4)
@@ -1549,7 +1595,7 @@ $statusProgress.Visible = $false
 $statusProgress.Size    = New-Object System.Drawing.Size(220, 16)
 $statusScanDate = New-Object System.Windows.Forms.ToolStripStatusLabel
 $statusScanDate.Text      = "Last scan: -"
-$statusScanDate.ForeColor = [System.Drawing.Color]::DimGray
+$statusScanDate.ForeColor = $script:ThMuted
 [void]$statusStrip.Items.Add($statusLabel)
 [void]$statusStrip.Items.Add($statusProgress)
 [void]$statusStrip.Items.Add($statusScanDate)
@@ -1562,8 +1608,17 @@ function Update-LastScanLabel {
 }
 
 $form.Controls.AddRange(@($pnlHeader, $grpSource, $btnScan, $btnStop, $btnExport,
-    $lblThrottle, $numThrottle, $lblSearch, $txtSearch, $lblScope, $cmbScope,
-    $btnSearch, $lblTabHint, $tabs, $statusStrip))
+    $lblThrottle, $numThrottle, $lblSearch, $txtSearch,
+    $btnSearch, $tabs, $statusStrip))
+$form.Add_Load({
+    Set-DarkTheme $form
+    $btnScan.BackColor = $script:ThAccent; $btnScan.ForeColor = [System.Drawing.Color]::White
+})
+$btnScan.BackColor = $script:ThAccent; $btnScan.ForeColor = [System.Drawing.Color]::White
+$btnSearch.BackColor = $script:ThAccent; $btnSearch.ForeColor = [System.Drawing.Color]::White
+$btnLoadAD.BackColor = $script:ThAccent; $btnLoadAD.ForeColor = [System.Drawing.Color]::White
+foreach ($b in @($btnScan, $btnSearch, $btnLoadAD)) { $b.FlatAppearance.BorderColor = $script:ThAccent }
+if (-not $script:DarkNative) { Write-Log "Dark title bar / tab control not available: $script:DarkNativeError" }
 
 # Repaint hygiene: double-buffer the containers and keep the header on top,
 # otherwise the initial layout pass can leave border ghosts in the header.
@@ -1607,7 +1662,7 @@ $itemAuto.Add_Click({
 })
 
 # --- Helper functions ------------------------------------------------------
-function Set-Status([string]$msg, [System.Drawing.Color]$color = [System.Drawing.Color]::Black) {
+function Set-Status([string]$msg, [System.Drawing.Color]$color = $script:ThText) {
     $statusLabel.Text      = $msg
     $statusLabel.ForeColor = $color
 }
@@ -1657,10 +1712,10 @@ function Rebuild-Tree([hashtable]$groups) {
             if ($res) {
                 $minFree = 100
                 if ("$($res.MinDiskFree)" -match '^[\d\.]+$') { $minFree = [double]$res.MinDiskFree }
-                if     ($minFree -lt 10) { $n.ForeColor = [System.Drawing.Color]::Red }
+                if     ($minFree -lt 10) { $n.ForeColor = $script:ThBad }
                 elseif ($minFree -lt 20) { $n.ForeColor = $script:WarnOrange }
             }
-            else { $n.ForeColor = [System.Drawing.Color]::Gray }
+            else { $n.ForeColor = $script:ThMuted }
             [void]$gNode.Nodes.Add($n)
         }
     }
@@ -1671,24 +1726,36 @@ function Rebuild-Tree([hashtable]$groups) {
     Update-ServerCount
 }
 
+function Get-ItemTone([string]$text) {
+    if ($text -match 'Status: EOL\b|EXPIRED|Past end of support|Expires <= 30 days') { return $script:ThBad }
+    if ($text -match 'Extended support|paid ESU|Expires <= (60|90) days') { return $script:ThWarn }
+    return $script:ThText
+}
+
+# Compact server view: one line per field ("Label <tab> value"), lists
+# continue in the value column; short lists are joined on one line.
 function Render-Detail($r, [System.Windows.Forms.RichTextBox]$box) {
     try {
         Set-Redraw $box $false   # suspend painting: renders in one smooth pass
         $box.Clear()
-        $headerFont  = New-Object System.Drawing.Font($script:FontName, 13, [System.Drawing.FontStyle]::Bold)
-        $sectionFont = New-Object System.Drawing.Font($script:FontName, 11, [System.Drawing.FontStyle]::Bold)
-        $labelFont   = New-Object System.Drawing.Font($script:FontName, 9.5, [System.Drawing.FontStyle]::Bold)
-        $itemFont    = New-Object System.Drawing.Font($script:FontName, 9.5)
+        $box.BackColor = $script:ThBg; $box.ForeColor = $script:ThText
+        $labelW      = 230
+        $box.SelectionTabs = [int[]]@($labelW)
+        $box.SelectionHangingIndent = $labelW
+        $headerFont  = New-Object System.Drawing.Font($script:FontName, 12, [System.Drawing.FontStyle]::Bold)
+        $sectionFont = New-Object System.Drawing.Font($script:FontName, 9.5, [System.Drawing.FontStyle]::Bold)
+        $labelFont   = New-Object System.Drawing.Font($script:FontName, 9)
+        $itemFont    = New-Object System.Drawing.Font($script:FontName, 9)
 
         $key = "$($r.ComputerName)".ToUpper()
         $box.SelectionFont  = $headerFont
-        $box.SelectionColor = $script:MerlinBlue
-        $box.AppendText("$($r.ComputerName)`n")
+        $box.SelectionColor = $script:ThAccent
+        $box.AppendText("$($r.ComputerName)")
         $box.SelectionFont  = $itemFont
-        $box.SelectionColor = [System.Drawing.Color]::DimGray
+        $box.SelectionColor = $script:ThMuted
         $grpTxt = Get-EffectiveGroup $key $r
         if ($script:Overrides.ContainsKey($key)) { $grpTxt += " (manual override)" }
-        $box.AppendText("Role groups: $grpTxt`n`n")
+        $box.AppendText("    $grpTxt`n")
 
         $currentSection = ""
         foreach ($def in $script:FieldDefs) {
@@ -1699,24 +1766,34 @@ function Render-Detail($r, [System.Windows.Forms.RichTextBox]$box) {
             if ($def.Section -ne $currentSection) {
                 $currentSection     = $def.Section
                 $box.SelectionFont  = $sectionFont
-                $box.SelectionColor = $script:MerlinBlue
-                $box.AppendText("$currentSection`n")
+                $box.SelectionColor = $script:ThAccent
+                $box.AppendText("`n$currentSection`n")
             }
+
+            $items = @(if ($def.Sep) { $val -split [regex]::Escape($def.Sep) } else { $val }) |
+                     ForEach-Object { "$_".Trim() } | Where-Object { $_ }
+            $items = @($items)
+            if ($items.Count -eq 0) { continue }
+            # Short lists (ports, IPs, roles...) fit on one line
+            $joined = $items -join ', '
+            if ($items.Count -gt 1 -and $joined.Length -le 110 -and -not ($items | Where-Object { $_ -match ': ' })) { $items = @($joined) }
 
             $box.SelectionFont  = $labelFont
-            $box.SelectionColor = [System.Drawing.Color]::Black
-            $box.AppendText("  $($def.Label):`n")
-
-            $items = if ($def.Sep) { $val -split [regex]::Escape($def.Sep) } else { @($val) }
+            $box.SelectionColor = $script:ThMuted
+            $box.AppendText("$($def.Label)")
+            $first = $true
             foreach ($item in $items) {
-                $item = "$item".Trim()
-                if (-not $item) { continue }
                 $box.SelectionFont  = $itemFont
-                $box.SelectionColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-                $box.AppendText("      - $item`n")
+                $box.SelectionColor = Get-ItemTone $item
+                $box.AppendText("`t$item`n")
+                $first = $false
             }
-            $box.AppendText("`n")
         }
+        # Same tab stop / hanging indent for every paragraph
+        $box.SelectAll()
+        $box.SelectionTabs = [int[]]@($labelW)
+        $box.SelectionHangingIndent = $labelW
+        $box.Select(0, 0)
         Set-Redraw $box $true
         Scroll-ToTop $box   # always start reading from the TOP
     }
@@ -1737,8 +1814,10 @@ function Open-ServerTab([string]$key) {
     $box = New-Object System.Windows.Forms.RichTextBox
     $box.Dock      = "Fill"
     $box.ReadOnly  = $true
-    $box.BackColor = [System.Drawing.Color]::White
-    $box.Font      = New-Object System.Drawing.Font($script:FontName, 10)
+    $box.BackColor = $script:ThBg; $box.ForeColor = $script:ThText; $box.BorderStyle = 'None'
+    $box.Font      = New-Object System.Drawing.Font($script:FontName, 9)
+    $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $script:ThBg; $tp.Padding = New-Object System.Windows.Forms.Padding(6)
+    Set-DarkWindow $box
     $tp.Controls.Add($box)
     [void]$tabs.TabPages.Add($tp)
     $tabs.SelectedTab = $tp
@@ -1755,8 +1834,10 @@ function Get-TabBox([string]$name, [bool]$select = $true) {
     }
     $tp  = New-Object System.Windows.Forms.TabPage ($name)
     $box = New-Object System.Windows.Forms.RichTextBox
-    $box.Dock = "Fill"; $box.ReadOnly = $true; $box.BackColor = [System.Drawing.Color]::White
-    $box.Font = New-Object System.Drawing.Font($script:FontName, 10)
+    $box.Dock = "Fill"; $box.ReadOnly = $true; $box.BackColor = $script:ThBg; $box.ForeColor = $script:ThText; $box.BorderStyle = 'None'
+    $box.Font = New-Object System.Drawing.Font($script:FontName, 9)
+    $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $script:ThBg; $tp.Padding = New-Object System.Windows.Forms.Padding(6)
+    Set-DarkWindow $box
     $tp.Controls.Add($box)
     [void]$tabs.TabPages.Add($tp)
     if ($select) { $tabs.SelectedTab = $tp }
@@ -1798,9 +1879,11 @@ function Finish-Scan {
         # Support / EOL dates: always re-checked against the official sources
         try { Update-AllLifecycle } catch { Write-Log "Lifecycle refresh failed: $($_.Exception.Message)" }
 
+        $script:LastUnreachable = @($failed | Where-Object { $_ })
         $cached = Save-Cache
         Build-SearchIndex
         Group-AndRebuild
+        Show-Overview
 
         # Refresh any open server tabs with fresh data
         foreach ($tp in $tabs.TabPages) {
@@ -1817,7 +1900,7 @@ function Finish-Scan {
     }
     catch {
         Write-Log "FINISH-SCAN ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
-        Set-Status "Error while finishing scan: $_ (see log)" ([System.Drawing.Color]::Red)
+        Set-Status "Error while finishing scan: $_ (see log)" $script:ThBad
     }
     Update-LastScanLabel
     $statusProgress.Visible = $false
@@ -1826,13 +1909,14 @@ function Finish-Scan {
     $btnExport.Enabled = ($script:Results.Keys.Count -gt 0)
 }
 
-function Invoke-Search {
+function Invoke-Search([switch]$KeepScope) {
+    if (-not $KeepScope) { $script:SearchScope = $script:AllCategories }
     $q = $txtSearch.Text.Trim()
     if (-not $q) { return }
     if ($script:Results.Keys.Count -eq 0) { Set-Status "Nothing to search - run a scan first." $script:WarnOrange; return }
     if ($script:SearchIndex.Keys.Count -eq 0) { Build-SearchIndex }
 
-    $scope = "$($cmbScope.SelectedItem)"
+    $scope = "$script:SearchScope"
     if (-not $scope) { $scope = $script:AllCategories }
     $allScopes = ($scope -eq $script:AllCategories)
 
@@ -1870,8 +1954,8 @@ function Invoke-Search {
             $target = $map[$ln]
             if ($target.Type -eq 'Server') { Open-ServerTab $target.Value }
             else {
-                $cmbScope.SelectedItem = $target.Value
-                Invoke-Search
+                $script:SearchScope = $target.Value
+                Invoke-Search -KeepScope
             }
         })
         $box.Cursor = [System.Windows.Forms.Cursors]::Default
@@ -1891,7 +1975,7 @@ function Invoke-Search {
     $box.SelectionColor = $script:MerlinBlue
     $box.AppendText("Search: `"$q`"")
     $box.SelectionFont  = $itemFont
-    $box.SelectionColor = [System.Drawing.Color]::DimGray
+    $box.SelectionColor = $script:ThMuted
     if (-not $allScopes) { $box.AppendText("   (scope: $scope)") }
     $box.AppendText("`n")
 
@@ -1906,7 +1990,7 @@ function Invoke-Search {
 
     $servers = @($found | Select-Object -ExpandProperty Server -Unique)
     $box.SelectionFont  = $itemFont
-    $box.SelectionColor = [System.Drawing.Color]::DimGray
+    $box.SelectionColor = $script:ThMuted
     $box.AppendText("$($found.Count) match(es) across $($servers.Count) server(s). Click a category to filter, a server name to open it.`n`n")
 
     # Keep categories in the same order as the inventory fields
@@ -1926,7 +2010,7 @@ function Invoke-Search {
         $box.SelectionColor = $script:MerlinBlue
         $box.AppendText(("   {0,-38}" -f $cat))
         $box.SelectionFont  = $itemFont
-        $box.SelectionColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+        $box.SelectionColor = $script:ThText
         $box.AppendText("  $($rows.Count) match(es) / $srvCnt server(s)`n")
     }
     if (-not $allScopes) {
@@ -1951,7 +2035,7 @@ function Invoke-Search {
             $box.AppendText("   >> $srv`n")
             foreach ($m in ($rows | Where-Object { $_.Server -eq $srv })) {
                 $box.SelectionFont  = $itemFont
-                $box.SelectionColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+                $box.SelectionColor = $script:ThText
                 $box.AppendText("        $($m.Value)`n")
             }
         }
@@ -1960,7 +2044,7 @@ function Invoke-Search {
     $box.Tag = $lineMap
 
     # Highlight every occurrence of the query in yellow
-    $hl  = [System.Drawing.Color]::FromArgb(255, 244, 141)
+    $hl  = (New-Rgb 105 90 20)
     $pos = 0
     while (($pos = $box.Find($q, $pos, [System.Windows.Forms.RichTextBoxFinds]::None)) -ge 0) {
         $box.SelectionBackColor = $hl
@@ -1981,572 +2065,10 @@ function Invoke-Search {
 }
 
 # ============================================================================
-# Reporting module: role-based reports (HTML + CSV per role)
+# Shared facts (v1.7): one normalised view of a scanned server, used by the
+# Overview (risks + profiles) and by the Report Builder.
 # ============================================================================
-
-# Servers in scope: checked in the tree and scanned; all scanned if none checked
-# Servers in scope: checked in the tree and scanned (all scanned if none are
-# checked, or when -AllServers); optionally only those in the given roles.
-function Get-ReportServerKeys([string[]]$Roles = @(), [switch]$AllServers) {
-    $base = @()
-    if (-not $AllServers) {
-        $base = @(Get-AllLeafNodes | Where-Object { $_.Checked } | ForEach-Object { Get-LeafName $_ } |
-            Where-Object { $script:Results.ContainsKey($_) } | Sort-Object -Unique)
-    }
-    if ($base.Count -eq 0) { $base = @($script:Results.Keys | Sort-Object) }
-    if (@($Roles).Count -gt 0) {
-        $base = @($base | Where-Object {
-            $gs = @(Get-EffectiveGroups $_ $script:Results[$_])
-            @($gs | Where-Object { $Roles -contains $_ }).Count -gt 0
-        })
-    }
-    return ,[string[]]$base
-}
-
-function Get-FeatureRows($inv, $def) {
-    if (-not $inv -or -not $def -or -not $def.Features) { return @() }
-    $names = @($def.Features)
-    return @($inv.Features | Where-Object { $_ } | Where-Object { $names -contains $_.Name -or $names -contains $_.Parent })
-}
-
-# Builds every report section as rows of objects. Both the HTML and the CSV
-# writers render from this, so they always contain the same data.
-function Get-ReportSections([string[]]$keys, [string[]]$Roles = @()) {
-    $sections = [ordered]@{}
-    $members  = [ordered]@{}
-    foreach ($g in $script:GroupOrder) { $members[$g] = New-Object System.Collections.Generic.List[string] }
-    foreach ($k in $keys) {
-        foreach ($g in @(Get-EffectiveGroups $k $script:Results[$k])) {
-            if (@($Roles).Count -gt 0 -and $Roles -notcontains $g) { continue }   # role-scoped report
-            if (-not $members.Contains($g)) { $members[$g] = New-Object System.Collections.Generic.List[string] }
-            $members[$g].Add($k)
-        }
-    }
-
-    # --- Summary ---------------------------------------------------------
-    $sections['Summary by Role'] = @{
-        Description = 'Servers per role group. A server with several roles is listed in every matching group.'
-        Rows = @(foreach ($g in $members.Keys) {
-            if ($members[$g].Count -eq 0) { continue }
-            [PSCustomObject]@{ 'Role Group' = $g; 'Servers' = $members[$g].Count; 'Server Names' = ($members[$g] -join ', ') }
-        })
-    }
-
-    # --- Classification evidence (why a server is in a group) ---------------
-    $sections['Role Classification'] = @{
-        Description = 'Why each server is in each role group (detected Windows role, database engine or service). Use it to verify the grouping.'
-        Rows = @(foreach ($k in $keys) {
-            $r = $script:Results[$k]
-            if ($script:Overrides.ContainsKey($k)) {
-                [PSCustomObject]@{ 'Server' = $k; 'Role Group' = $script:Overrides[$k]; 'Evidence' = 'Manual override (right-click)' }
-                continue
-            }
-            foreach ($d in @(Get-RoleGroupDetails $r)) { [PSCustomObject]@{ 'Server' = $k; 'Role Group' = $d.Group; 'Evidence' = $d.Reason } }
-        })
-    }
-
-    # --- Operating systems ---------------------------------------------------
-    $sections['Operating Systems'] = @{
-        Description = 'OS version, install date and Microsoft Lifecycle dates (learn.microsoft.com).'
-        Rows = @(foreach ($k in $keys) {
-            $r = $script:Results[$k]; $inv = Get-Inv $r
-            $lc = Get-Lc (Get-OsLifecycleKey $r)
-            [PSCustomObject]@{
-                'Server'            = $k
-                'Role Groups'       = Get-EffectiveGroup $k $r
-                'Operating System'  = if ($inv -and $inv.OS) { $inv.OS.Caption } else { "$($r.OperatingSystem)" }
-                'Build'             = if ($inv -and $inv.OS) { "$($inv.OS.Build)$(if ($inv.OS.UBR) { ".$($inv.OS.UBR)" })" } else { '' }
-                'OS Install Date'   = "$($r.InstallDate)"
-                'Last Restart'      = "$($r.LastRestartDate)"
-                'Lifecycle Policy'  = if ($lc) { $lc.Policy } else { '' }
-                'Mainstream End'    = if ($lc) { Format-LcDate $lc.SupportEnd } else { '' }
-                'Extended End (EOL)'= if ($lc) { Format-LcDate $lc.EOL } else { '' }
-                'ESU End'           = if ($lc -and $lc.ESUEnd) { Format-LcDate $lc.ESUEnd } else { '' }
-                'Days to EOL'       = if ($lc) { $lc.DaysToEOL } else { $null }
-                'Status'            = if ($lc) { $lc.Status } else { 'Not resolved' }
-                'Official Source'   = if ($lc) { $lc.Source } else { '' }
-                'Source Note'       = if ($lc) { $lc.SourceNote } else { '' }
-            }
-        })
-    }
-
-    # --- Role specific sections ---------------------------------------------
-    foreach ($g in $members.Keys) {
-        $list = $members[$g]
-        if ($list.Count -eq 0) { continue }
-        $def = $script:RoleDefs | Where-Object { $_.Group -eq $g } | Select-Object -First 1
-
-        if ($g -eq 'SQL / Database') {
-            $sections[$g] = @{
-                Description = 'Database engines (MSSQL, MariaDB, MySQL, PostgreSQL, Firebird, ...): version, install date and vendor lifecycle.'
-                Rows = @(foreach ($k in $list) {
-                    $r = $script:Results[$k]; $inv = Get-Inv $r
-                    if (-not $inv) {
-                        [PSCustomObject]@{ 'Server' = $k; 'Product' = 'Rescan with v1.5'; 'Version' = "$($r.SQLInstanceDetails)" }
-                        continue
-                    }
-                    foreach ($db in @($inv.Databases | Where-Object { $_ })) {
-                        $lc = Get-Lc (Get-DbLifecycleKey $db)
-                        [PSCustomObject]@{
-                            'Server'          = $k
-                            'Product'         = $db.Product
-                            'Version'         = $db.Version
-                            'Edition/Package' = $db.Edition
-                            'Instance'        = $db.Instance
-                            'Service Pack'    = $db.ServicePack
-                            'Install Date'    = $db.InstallDate
-                            'Install Date Source' = $db.InstallDateSource
-                            'Service State'   = $db.ServiceState
-                            'Release'         = if ($lc) { $lc.Release } else { '' }
-                            'Support End'     = if ($lc) { Format-LcDate $lc.SupportEnd } else { '' }
-                            'EOL'             = if ($lc) { Format-LcDate $lc.EOL } else { '' }
-                            'ESU End'         = if ($lc -and $lc.ESUEnd) { Format-LcDate $lc.ESUEnd } else { '' }
-                            'Days to EOL'     = if ($lc) { $lc.DaysToEOL } else { $null }
-                            'Status'          = if ($lc) { $lc.Status } else { 'No official source for this product' }
-                            'Note'            = if ($lc) { $lc.Note } else { '' }
-                            'Official Source' = if ($lc) { $lc.Source } else { '' }
-                        }
-                    }
-                })
-            }
-        }
-        elseif ($g -eq 'IIS / Web') {
-            $sections[$g] = @{
-                Description = 'IIS version (registry InetStp), approximate install date, sites and lifecycle (IIS follows the Windows lifecycle).'
-                Rows = @(foreach ($k in $list) {
-                    $r = $script:Results[$k]; $inv = Get-Inv $r
-                    $lc = Get-Lc (Get-IisLifecycleKey $r)
-                    [PSCustomObject]@{
-                        'Server'          = $k
-                        'IIS Version'     = if ($inv -and $inv.IIS) { $inv.IIS.Version } else { '' }
-                        'Version String'  = if ($inv -and $inv.IIS) { $inv.IIS.VersionString } else { '' }
-                        'Install Date (approx.)' = if ($inv -and $inv.IIS) { $inv.IIS.InstallDate } else { '' }
-                        'Sites'           = if ($inv -and $inv.IIS) { $inv.IIS.SiteCount } else { $null }
-                        'Site List'       = if ($inv -and $inv.IIS) { @($inv.IIS.Sites) -join ', ' } else { "$($r.Websites)" }
-                        'Release'         = if ($lc) { $lc.Release } else { '' }
-                        'Support End / EOL' = if ($lc) { Format-LcDate $lc.EOL } else { '' }
-                        'Days to EOL'     = if ($lc) { $lc.DaysToEOL } else { $null }
-                        'Status'          = if ($lc) { $lc.Status } else { 'Not resolved' }
-                        'Official Source' = if ($lc) { $lc.Source } else { '' }
-                    }
-                })
-            }
-        }
-        elseif ($g -in '3rd Party', 'Other', 'Not Scanned / Unreachable' -or -not $def) {
-            $sections[$g] = @{
-                Description = 'Servers without a detected Microsoft server role.'
-                Rows = @(foreach ($k in $list) {
-                    $r = $script:Results[$k]
-                    [PSCustomObject]@{ 'Server' = $k; 'Operating System' = "$($r.OperatingSystem)"; 'Running 3rd Party Services' = "$($r.ThirdPartyServices)" }
-                })
-            }
-        }
-        else {
-            $sections[$g] = @{
-                Description = "Installed role / role services for '$g' and the host OS lifecycle."
-                Rows = @(foreach ($k in $list) {
-                    $r = $script:Results[$k]; $inv = Get-Inv $r
-                    $lc = Get-Lc (Get-OsLifecycleKey $r)
-                    $fr = Get-FeatureRows $inv $def
-                    [PSCustomObject]@{
-                        'Server'          = $k
-                        'Operating System'= if ($inv -and $inv.OS) { $inv.OS.Caption } else { "$($r.OperatingSystem)" }
-                        'Role / Role Services' = if ($fr) { ($fr | ForEach-Object { $_.DisplayName }) -join ', ' } else { ($def.Features -join ', ') }
-                        'OS EOL'          = if ($lc) { Format-LcDate $lc.EOL } else { '' }
-                        'Status'          = if ($lc) { $lc.Status } else { 'Not resolved' }
-                    }
-                })
-            }
-        }
-    }
-
-    # --- Windows Server roles & features (all servers) ------------------------
-    $sections['Windows Server Roles & Features'] = @{
-        Description = 'Every installed role, role service and feature (Get-WindowsFeature).'
-        Rows = @(foreach ($k in $keys) {
-            $inv = Get-Inv $script:Results[$k]
-            if (-not $inv) { [PSCustomObject]@{ 'Server' = $k; 'Type' = ''; 'Name' = "$($script:Results[$k].Roles)"; 'Display Name' = 'Rescan with v1.5 for details'; 'Parent' = '' }; continue }
-            foreach ($f in @($inv.Features | Where-Object { $_ } | Sort-Object @{ Expression = { switch ($_.Type) { 'Role' { 0 } 'Role Service' { 1 } default { 2 } } } }, Name)) {
-                [PSCustomObject]@{ 'Server' = $k; 'Type' = $f.Type; 'Name' = $f.Name; 'Display Name' = $f.DisplayName; 'Parent' = $f.Parent }
-            }
-        })
-    }
-
-    # --- Certificates ---------------------------------------------------------
-    $certRows = @(foreach ($k in $keys) {
-        $inv = Get-Inv $script:Results[$k]
-        if (-not $inv) { continue }
-        foreach ($c in @($inv.Certificates | Where-Object { $_ })) {
-            $days = Get-DaysLeft $c.NotAfter
-            [PSCustomObject]@{
-                'Server'      = $k
-                'Status'      = Get-CertStatus $days
-                'Days Left'   = $days
-                'Expires'     = $c.NotAfter
-                'Issued'      = $c.NotBefore
-                'Subject'     = $c.Subject
-                'DNS Names'   = @($c.DnsNames) -join ', '
-                'Issuer'      = $c.Issuer
-                'Self-signed' = $c.SelfSigned
-                'Private Key' = $c.HasPrivateKey
-                'Used By'     = @($c.BoundTo) -join ', '
-                'Store'       = $c.Store
-                'Thumbprint'  = $c.Thumbprint
-            }
-        }
-    })
-    $sections['SSL Certificates'] = @{
-        Description = 'All certificates in LocalMachine\My and WebHosting, soonest expiry first, with the IIS bindings that use them.'
-        Rows = @($certRows | Sort-Object @{ Expression = { if ($null -eq $_.'Days Left') { [int]::MaxValue } else { $_.'Days Left' } } })
-    }
-    return $sections
-}
-
-function Get-StatusClass([string]$v) {
-    if ($v -match '^(EOL|EXPIRED)') { return 'bad' }
-    if ($v -match '^(Extended support|Expires <= (30|60))') { return 'warn' }
-    if ($v -match '^Expires <= 90') { return 'soon' }
-    if ($v -match '^(Supported|Valid)') { return 'ok' }
-    return ''
-}
-
-# Interactive single-file HTML report. All data is embedded as JSON and
-# rendered client-side with textContent (no HTML injection), no external
-# resources, works offline. Filters: role chips (multi-select), problem
-# filter, free-text search, sortable columns, per-section CSV of the view.
-# Deep link: report.html#roles=IIS%20%2F%20Web,SQL%20%2F%20Database&problems=1
-function ConvertTo-HtmlReport($sections, [string[]]$keys) {
-    $enc = { param($v) [Net.WebUtility]::HtmlEncode("$v") }
-
-    $serverGroups = @{}
-    foreach ($k in $keys) { $serverGroups[$k] = [string[]]@(Get-EffectiveGroups $k $script:Results[$k]) }
-    $groupNames = New-Object System.Collections.Generic.List[string]
-    foreach ($g in (@($script:GroupOrder) + @($serverGroups.Values | ForEach-Object { $_ }))) {
-        if (-not $groupNames.Contains($g) -and @($serverGroups.Values | Where-Object { $_ -contains $g }).Count) { $groupNames.Add($g) }
-    }
-
-    $secList = New-Object System.Collections.Generic.List[object]
-    foreach ($name in $sections.Keys) {
-        $sec  = $sections[$name]
-        $rows = @($sec.Rows)
-        $cols = New-Object System.Collections.Generic.List[string]
-        foreach ($row in $rows) { foreach ($p in $row.PSObject.Properties.Name) { if (-not $cols.Contains($p)) { $cols.Add($p) } } }
-        $data = New-Object System.Collections.Generic.List[object]
-        foreach ($row in $rows) {
-            $cells = [string[]]@(foreach ($c in $cols) {
-                $p = $row.PSObject.Properties[$c]
-                if ($p -and $null -ne $p.Value) { "$($p.Value)" } else { '' }
-            })
-            $data.Add($cells)
-        }
-        $secList.Add(@{
-            name = $name
-            desc = "$($sec.Description)"
-            role = if ($groupNames.Contains($name)) { $name } else { $null }
-            cols = $cols.ToArray()
-            rows = $data.ToArray()
-        })
-    }
-
-    $payload = @{
-        meta = @{
-            generated = (Get-Date).ToString('yyyy-MM-dd HH:mm')
-            by        = "$env:USERDOMAIN\$env:USERNAME"
-            host      = "$env:COMPUTERNAME"
-            version   = "$($script:AppVersion)"
-            hosts     = [string[]]$script:OfficialHosts
-        }
-        groups   = $groupNames.ToArray()
-        servers  = $serverGroups
-        sections = $secList.ToArray()
-    }
-    # "</" can never close the <script> block; < > & are escaped as well
-    $json = ($payload | ConvertTo-Json -Depth 8 -Compress) -replace '</', '<\/' -replace '<!--', '<\!--'
-
-    $css = @'
-:root{--blue:#1f3a93;--blue-lt:#e8eefc;--ink:#1d2433;--muted:#5f6b7a;--line:#d9dee8;--bg:#fff;--row:#fafbfd;
---bad:#b42318;--bad-bg:#fde8e7;--warn:#9a5b00;--warn-bg:#fff1d6;--soon:#7a6a00;--soon-bg:#fffbd6;--ok:#00783c;--ok-bg:#e3f5ea}
-*{box-sizing:border-box}
-body{font-family:'Segoe UI',Arial,sans-serif;color:var(--ink);margin:0;background:var(--bg)}
-header{background:var(--blue-lt);padding:18px 28px 14px;border-bottom:3px solid var(--blue)}
-header h1{margin:0;color:var(--blue);font-size:24px}
-header p{margin:4px 0 0;color:var(--muted);font-size:13px}
-.bar{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid var(--line);padding:10px 28px;box-shadow:0 2px 6px rgba(31,58,147,.06)}
-.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-.row+.row{margin-top:8px}
-.lbl{font-size:12px;color:var(--muted);margin-right:4px;min-width:42px}
-.chip{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:999px;padding:4px 11px;font:inherit;font-size:12.5px;cursor:pointer;line-height:1.4}
-.chip:hover{border-color:var(--blue)}
-.chip[aria-pressed=true]{background:var(--blue);border-color:var(--blue);color:#fff}
-.chip .n{opacity:.7;margin-left:4px;font-size:11px}
-.chip.prob[aria-pressed=true]{background:var(--bad);border-color:var(--bad)}
-input[type=search]{border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit;font-size:13px;width:280px;max-width:100%}
-.btn{border:1px solid var(--blue);background:#fff;color:var(--blue);border-radius:6px;padding:5px 10px;font:inherit;font-size:12px;cursor:pointer}
-.btn:hover{background:var(--blue-lt)}
-main{padding:8px 28px 40px}
-.kpis{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
-.kpi{border:1px solid var(--line);border-radius:8px;padding:10px 16px;min-width:150px;background:#fff;text-align:left;font:inherit;cursor:default}
-.kpi b{display:block;font-size:24px} .kpi span{font-size:12px;color:var(--muted)}
-.kpi.bad b{color:var(--bad)} .kpi.warn b{color:var(--warn)}
-nav{font-size:13px;margin:4px 0 6px;line-height:1.9} nav a{color:var(--blue);margin-right:14px;text-decoration:none;white-space:nowrap}
-nav a:hover{text-decoration:underline}
-section{margin-top:26px}
-.sh{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding-bottom:4px}
-h2{color:var(--blue);font-size:18px;margin:0}
-.cnt{font-size:12px;color:var(--muted)} .sh .btn{margin-left:auto}
-.desc{color:var(--muted);font-size:12px;margin:6px 0 8px}
-.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:6px}
-table{border-collapse:collapse;font-size:12px;width:100%}
-th{background:var(--blue);color:#fff;text-align:left;padding:7px 8px;white-space:nowrap;cursor:pointer;user-select:none;position:sticky;top:0}
-th:hover{background:#2a4bb5} th .ar{opacity:.85;margin-left:4px;font-size:10px}
-td{border-top:1px solid var(--line);padding:5px 8px;vertical-align:top}
-tr:nth-child(even) td{background:var(--row)}
-td.bad{background:var(--bad-bg)!important;color:var(--bad);font-weight:600}
-td.warn{background:var(--warn-bg)!important;color:var(--warn);font-weight:600}
-td.soon{background:var(--soon-bg)!important;color:var(--soon);font-weight:600}
-td.ok{background:var(--ok-bg)!important;color:var(--ok);font-weight:600}
-td a{color:var(--blue)} mark{background:#fff3a3;padding:0}
-.empty{color:var(--muted);font-style:italic;font-size:12px;padding:8px 0}
-.hidden{display:none!important}
-footer{color:var(--muted);font-size:11px;padding:0 28px 24px}
-@media print{.bar,.sh .btn{display:none}th{position:static}section{break-inside:avoid-page}}
-'@
-
-    $js = @'
-(function(){
-"use strict";
-var D=JSON.parse(document.getElementById("sw-data").textContent);
-var S={roles:[],problems:false,q:""};
-var sortState={};
-function el(t,c,txt){var e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
-function cls(v){v=String(v||"");
- if(/^(EOL|EXPIRED)/.test(v))return"bad";
- if(/^(Extended support|Expires <= (30|60))/.test(v))return"warn";
- if(/^Expires <= 90/.test(v))return"soon";
- if(/^(Supported|Valid)/.test(v))return"ok";return"";}
-function isProblem(sec,row){var i=sec.cols.indexOf("Status");if(i<0)return false;var c=cls(row[i]);return c==="bad"||c==="warn"||c==="soon";}
-function serverIn(srv){if(!S.roles.length)return true;var g=D.servers[srv]||[];for(var i=0;i<g.length;i++)if(S.roles.indexOf(g[i])>=0)return true;return false;}
-function sectionVisible(sec){if(S.problems&&sec.cols.indexOf("Status")<0)return false;return !sec.role||!S.roles.length||S.roles.indexOf(sec.role)>=0;}
-function rowVisible(sec,row){
- var gi=sec.cols.indexOf("Role Group"),si=sec.cols.indexOf("Server");
- if(S.roles.length){
-  if(gi>=0&&S.roles.indexOf(row[gi])<0)return false;
-  if(gi<0&&si>=0&&!serverIn(row[si]))return false;}
- if(S.problems&&sec.cols.indexOf("Status")>=0&&!isProblem(sec,row))return false;
- if(S.q){var q=S.q.toLowerCase(),hit=false;for(var k=0;k<row.length;k++)if(String(row[k]).toLowerCase().indexOf(q)>=0){hit=true;break;}if(!hit)return false;}
- return true;}
-function cmp(a,b){var na=parseFloat(a),nb=parseFloat(b);
- if(/^-?\d+(\.\d+)?$/.test(a)&&/^-?\d+(\.\d+)?$/.test(b))return na-nb;
- if(a===""&&b!=="")return 1;if(b===""&&a!=="")return -1;
- return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:"base"});}
-function hostOk(u){var m=/^https:\/\/([^\/]+)\//.exec(u);return m&&D.meta.hosts.indexOf(m[1])>=0?m[1]:null;}
-function fillCell(td,val){var h=hostOk(val);
- if(h){var a=el("a",null,h);a.href=val;a.target="_blank";a.rel="noopener";td.appendChild(a);return;}
- if(S.q){var s=String(val),lo=s.toLowerCase(),q=S.q.toLowerCase(),p=0,i;
-  while((i=lo.indexOf(q,p))>=0){td.appendChild(document.createTextNode(s.slice(p,i)));td.appendChild(el("mark",null,s.slice(i,i+q.length)));p=i+q.length;}
-  td.appendChild(document.createTextNode(s.slice(p)));return;}
- td.textContent=val;}
-function visibleRows(sec,idx){var rows=sec.rows.filter(function(r){return rowVisible(sec,r);});
- var st=sortState[idx];if(st){rows=rows.slice().sort(function(a,b){return st.dir*cmp(a[st.col],b[st.col]);});}
- return rows;}
-function csv(sec,rows){var esc=function(v){v=String(v==null?"":v);if(/^[=+\-@\t\r]/.test(v)&&!/^-?\d+(\.\d+)?$/.test(v))v="'"+v;return /[;"\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
- var out=[sec.cols.map(esc).join(";")];rows.forEach(function(r){out.push(r.map(esc).join(";"));});
- var blob=new Blob(["\ufeff"+out.join("\r\n")],{type:"text/csv;charset=utf-8"});
- var a=el("a");a.href=URL.createObjectURL(blob);
- a.download="ServerWizard_"+sec.name.replace(/[^A-Za-z0-9]+/g,"_").replace(/^_|_$/g,"")+(S.roles.length?"_"+S.roles.join("+").replace(/[^A-Za-z0-9+]+/g,""):"")+".csv";
- document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},0);}
-function renderSection(sec,idx,host){
- host.textContent="";
- var rows=visibleRows(sec,idx);
- var head=el("div","sh");head.appendChild(el("h2",null,sec.name));
- head.appendChild(el("span","cnt",rows.length+" of "+sec.rows.length+" row(s)"));
- var b=el("button","btn","Download view (CSV)");b.type="button";b.onclick=function(){csv(sec,rows);};head.appendChild(b);
- host.appendChild(head);host.appendChild(el("p","desc",sec.desc));
- if(!rows.length){host.appendChild(el("p","empty","No rows match the current filter."));return rows.length;}
- var wrap=el("div","wrap"),t=el("table"),thead=el("thead"),tr=el("tr");
- sec.cols.forEach(function(c,ci){var th=el("th",null,c);var st=sortState[idx];
-  if(st&&st.col===ci)th.appendChild(el("span","ar",st.dir>0?"\u25B2":"\u25BC"));
-  th.title="Sort by "+c;th.onclick=function(){var s=sortState[idx];sortState[idx]={col:ci,dir:(s&&s.col===ci)?-s.dir:1};renderSection(sec,idx,host);};
-  tr.appendChild(th);});
- thead.appendChild(tr);t.appendChild(thead);
- var tb=el("tbody"),si=sec.cols.indexOf("Status");
- rows.forEach(function(r){var row=el("tr");r.forEach(function(v,ci){var td=el("td");if(ci===si){var c=cls(v);if(c)td.className=c;}fillCell(td,v);row.appendChild(td);});tb.appendChild(row);});
- t.appendChild(tb);wrap.appendChild(t);host.appendChild(wrap);return rows.length;}
-function sec(name){for(var i=0;i<D.sections.length;i++)if(D.sections[i].name===name)return D.sections[i];return null;}
-function countRows(name,test){var s=sec(name);if(!s)return 0;var i=s.cols.indexOf("Status");
- return s.rows.filter(function(r){return rowVisible(s,r)&&test(String(r[i]||""));}).length;}
-function renderKpis(){var k=document.getElementById("kpis");k.textContent="";
- var n=Object.keys(D.servers).filter(serverIn).length;
- var items=[["Servers in view",n,""],
-  ["OS past EOL",countRows("Operating Systems",function(v){return /^EOL/.test(v);}),"bad"],
-  ["DB engines past EOL",countRows("SQL / Database",function(v){return /^EOL/.test(v);}),"bad"],
-  ["Certificates expired",countRows("SSL Certificates",function(v){return v==="EXPIRED";}),"bad"],
-  ["Certificates <= 30 days",countRows("SSL Certificates",function(v){return v==="Expires <= 30 days";}),"warn"]];
- items.forEach(function(x){var d=el("div","kpi "+x[2]);d.appendChild(el("b",null,String(x[1])));d.appendChild(el("span",null,x[0]));k.appendChild(d);});}
-function render(){
- var nav=document.getElementById("nav");nav.textContent="";
- D.sections.forEach(function(s,i){var host=document.getElementById("sec"+i);
-  if(!sectionVisible(s)){host.classList.add("hidden");return;}
-  host.classList.remove("hidden");var c=renderSection(s,i,host);
-  var a=el("a",null,s.name+" ("+c+")");a.href="#sec"+i;a.onclick=function(e){e.preventDefault();host.scrollIntoView({behavior:"smooth"});};nav.appendChild(a);});
- renderKpis();
- document.querySelectorAll("#roles .chip").forEach(function(b){var r=b.getAttribute("data-role");
-  b.setAttribute("aria-pressed",String(r===""?S.roles.length===0:S.roles.indexOf(r)>=0));});
- document.getElementById("prob").setAttribute("aria-pressed",String(S.problems));
- var h="roles="+S.roles.map(encodeURIComponent).join(",")+(S.problems?"&problems=1":"");
- if(S.roles.length||S.problems){history.replaceState(null,"","#"+h);}else{history.replaceState(null,"",location.pathname+location.search);}}
-function readHash(){S.roles=[];S.problems=false;var h=location.hash.replace(/^#/,"");if(!h||h.indexOf("sec")===0)return;h.split("&").forEach(function(p){var kv=p.split("=");
- if(kv[0]==="roles"&&kv[1])S.roles=kv[1].split(",").map(decodeURIComponent).filter(function(r){return D.groups.indexOf(r)>=0;});
- if(kv[0]==="problems")S.problems=kv[1]==="1";});}
-function build(){
- var m=D.meta;document.getElementById("meta").textContent="Generated "+m.generated+" by "+m.by+" on "+m.host+" \u00B7 Server Wizard v"+m.version+" \u00B7 "+Object.keys(D.servers).length+" server(s)";
- var roles=document.getElementById("roles");
- var all=el("button","chip","All roles");all.type="button";all.setAttribute("data-role","");all.onclick=function(){S.roles=[];render();};roles.appendChild(all);
- D.groups.forEach(function(g){var n=Object.keys(D.servers).filter(function(s){return D.servers[s].indexOf(g)>=0;}).length;
-  var b=el("button","chip",g);b.type="button";b.setAttribute("data-role",g);b.appendChild(el("span","n",String(n)));
-  b.title="Click: show only "+g+" | Ctrl/Shift+click: add to selection";
-  b.onclick=function(e){var i=S.roles.indexOf(g);
-   if(e.ctrlKey||e.metaKey||e.shiftKey){if(i>=0)S.roles.splice(i,1);else S.roles.push(g);}
-   else{S.roles=(S.roles.length===1&&i===0)?[]:[g];}
-   render();};
-  roles.appendChild(b);});
- var p=document.getElementById("prob");p.onclick=function(){S.problems=!S.problems;render();};
- var q=document.getElementById("q"),t;q.oninput=function(){clearTimeout(t);t=setTimeout(function(){S.q=q.value.trim();render();},180);};
- document.getElementById("reset").onclick=function(){S={roles:[],problems:false,q:""};q.value="";sortState={};render();};
- var main=document.getElementById("sections");D.sections.forEach(function(s,i){var x=el("section");x.id="sec"+i;main.appendChild(x);});
- readHash();render();
- window.addEventListener("hashchange",function(){if(location.hash.indexOf("#sec")===0)return;readHash();render();});}
-build();
-})();
-'@
-
-    $title = 'Server Wizard - Role Report'
-    $srcs  = ($script:OfficialHosts | ForEach-Object { & $enc $_ }) -join ', '
-    return @"
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>$title</title>
-<style>$css</style></head><body>
-<header><h1>Server Wizard &ndash; Role-Based Report</h1><p id="meta"></p></header>
-<div class="bar">
- <div class="row" id="roles"><span class="lbl">Roles</span></div>
- <div class="row"><span class="lbl">Filter</span>
-  <button type="button" class="chip prob" id="prob" aria-pressed="false">Problems only (EOL / expiring)</button>
-  <input type="search" id="q" placeholder="Search server, product, version, certificate..." aria-label="Search">
-  <button type="button" class="btn" id="reset">Reset</button>
- </div>
-</div>
-<main><div class="kpis" id="kpis"></div><nav id="nav"></nav><div id="sections"></div></main>
-<footer>Click a role to show only that role (Ctrl/Shift+click to combine), click a column header to sort. The address bar keeps the selected view, so the link can be bookmarked. Support and EOL dates come from official vendor sources only ($srcs). Install dates marked approx. are folder/binary creation times. Read-only inventory; no changes were made to any server.</footer>
-<script type="application/json" id="sw-data">$json</script>
-<script>$js</script>
-</body></html>
-"@
-}
-
-# CSV/Excel formula-injection guard for text cells
-function ConvertTo-SafeCsvRow($row) {
-    $o = [ordered]@{}
-    foreach ($p in $row.PSObject.Properties) {
-        $v = $p.Value
-        if ($v -is [string] -and $v -match '^[=+\-@\t\r]' -and $v -notmatch '^-?\d+(\.\d+)?$') { $v = "'" + $v }
-        $o[$p.Name] = $v
-    }
-    return [PSCustomObject]$o
-}
-
-
-function Get-ReportScopeText([string[]]$Roles, [int]$serverCount, [bool]$AllServers) {
-    $r = if (@($Roles).Count -gt 0) { (@($Roles) -join ', ') } else { (T 'scope_all_roles') }
-    $s = if ($AllServers) { "all scanned servers" } else { "selected servers" }
-    # Plain text: the renderer HTML-encodes it
-    return [Net.WebUtility]::HtmlDecode("$r | $s")
-}
-
-# Builds the readable report (HTML and / or PDF) for the chosen roles / servers.
-function Invoke-RoleReport {
-    param(
-        [ValidateSet('Html', 'Pdf', 'Both')][string]$Format = 'Html',
-        [string[]]$Roles = @(),
-        [switch]$AllServers
-    )
-    $Language = 'en'   # report output is English only
-    if ($script:Results.Keys.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Run a scan first.", "Export Report", "OK", "Information") | Out-Null
-        return
-    }
-    $keys = [string[]](Get-ReportServerKeys -Roles $Roles -AllServers:$AllServers)
-    if ($keys.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No scanned server matches the selected roles.", "Export Report", "OK", "Information") | Out-Null
-        return
-    }
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmm'
-    $tag   = ''
-    if (@($Roles).Count -gt 0 -and @($Roles).Count -le 3) { $tag = '_' + ((@($Roles) | ForEach-Object { $_ -replace '[^A-Za-z0-9]+', '' }) -join '+') }
-
-    $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    if ($Format -eq 'Html') { $dlg.Filter = "HTML report (*.html)|*.html"; $ext = 'html' }
-    else { $dlg.Filter = "PDF report (*.pdf)|*.pdf"; $ext = 'pdf' }
-    $dlg.FileName = "ServerWizard_Report${tag}_$stamp.$ext"
-    $dlg.Title = if ($Format -eq 'Both') { 'Save report (the HTML copy is saved next to the PDF)' } else { 'Save report' }
-    try { if ($dlg.ShowDialog($form) -ne "OK") { return }; $target = $dlg.FileName } finally { $dlg.Dispose() }
-
-    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    $tmpHtml = $null
-    try {
-        Write-Log "Report ($Format, $Language) started for $($keys.Count) servers -> $target"
-        Set-Status "Building report for $($keys.Count) server(s)..."
-        # Lifecycle dates are re-checked against the official sources
-        # (skipped only if that already happened in the last 15 minutes)
-        Update-LifecycleIfStale
-        $script:RptLang = $Language
-        $model = Get-ReportModel $keys $Roles
-        $html  = ConvertTo-ReadableReport $model $Language (Get-ReportScopeText $Roles $keys.Count ([bool]$AllServers))
-        $utf8  = New-Object Text.UTF8Encoding($true)
-
-        switch ($Format) {
-            'Html' {
-                [IO.File]::WriteAllText($target, $html, $utf8)
-                $open = $target
-            }
-            'Both' {
-                $htmlPath = [IO.Path]::ChangeExtension($target, '.html')
-                [IO.File]::WriteAllText($htmlPath, $html, $utf8)
-                Set-Status "Printing PDF with the local browser..."
-                Convert-HtmlToPdf $htmlPath $target
-                $open = $target
-            }
-            'Pdf' {
-                $tmpHtml = Join-Path $env:TEMP ("ServerWizard_report_" + [guid]::NewGuid().ToString('N') + '.html')
-                [IO.File]::WriteAllText($tmpHtml, $html, $utf8)
-                Set-Status "Printing PDF with the local browser..."
-                Convert-HtmlToPdf $tmpHtml $target
-                $open = $target
-            }
-        }
-        Set-Status "Report saved ($($keys.Count) servers): $target" $script:OkGreen
-        Write-Log "Report ($Format) finished: $target"
-        try { Start-Process -FilePath $open } catch { Write-Log "Could not open report: $($_.Exception.Message)" }
-    }
-    catch {
-        Write-Log "REPORT FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
-        $msg = "Report failed: $($_.Exception.Message)"
-        if ($Format -ne 'Html') { $msg += "`n`nTip: choose the HTML format and use 'Print / PDF' in the browser." }
-        [System.Windows.Forms.MessageBox]::Show("$msg`n`nSee log: $script:LogFile", "Export Report", "OK", "Error") | Out-Null
-        Set-Status "Report failed (see log)." ([System.Drawing.Color]::Red)
-    }
-    finally {
-        if ($tmpHtml -and (Test-Path -LiteralPath $tmpHtml)) { Remove-Item -LiteralPath $tmpHtml -Force -ErrorAction SilentlyContinue }
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-    }
-}
-
-# ============================================================================
-# Reports module (in-app): a "Reports" tab with a role selector, a sortable
-# grid of the selected report section and export / refresh buttons.
-# ============================================================================
-$script:ReportSections = $null
-$script:ReportKeys     = @()
+function HE($v) { return [Net.WebUtility]::HtmlEncode("$v") }
 
 # Re-checks the official sources unless that already happened very recently
 function Update-LifecycleIfStale([int]$maxAgeMinutes = 15) {
@@ -2554,833 +2076,549 @@ function Update-LifecycleIfStale([int]$maxAgeMinutes = 15) {
     Update-AllLifecycle
 }
 
-function ConvertTo-ReportTable($rows) {
-    $dt = New-Object System.Data.DataTable
-    $rows = @($rows)
-    $cols = @()
-    foreach ($row in $rows) { foreach ($p in $row.PSObject.Properties.Name) { if ($cols -notcontains $p) { $cols += $p } } }
-    foreach ($c in $cols) { [void]$dt.Columns.Add($c, [string]) }
-    foreach ($row in $rows) {
-        $dr = $dt.NewRow()
-        foreach ($c in $cols) {
-            $p = $row.PSObject.Properties[$c]
-            $dr[$c] = if ($p -and $null -ne $p.Value) { "$($p.Value)" } else { '' }
+function Format-Day($d) { if ($d) { return ([datetime]$d).ToString('yyyy-MM-dd') } return '' }
+
+# "C: 80GB total / 12GB free (%15)" -> objects (scan format since v1.0)
+function Get-DiskList($r) {
+    $out = @()
+    foreach ($part in ("$($r.Disks)" -split ' \| ')) {
+        if ($part -match '^\s*(\S+)\s+([\d\.,]+)GB total / ([\d\.,]+)GB free \(%([\d\.,]+)\)') {
+            $out += [PSCustomObject]@{
+                Drive   = $matches[1]
+                TotalGB = [double]($matches[2] -replace ',', '.')
+                FreeGB  = [double]($matches[3] -replace ',', '.')
+                FreePct = [double]($matches[4] -replace ',', '.')
+            }
         }
-        [void]$dt.Rows.Add($dr)
     }
-    return ,$dt
+    return $out
 }
 
-function Show-ReportSection {
-    $ui = $script:ReportsUi
-    if (-not $ui -or -not $script:ReportSections) { return }
-    $name = "$($ui.Combo.SelectedItem)" -replace '\s+\(\d+\)$', ''
-    if (-not $script:ReportSections.Contains($name)) { return }
-    $sec = $script:ReportSections[$name]
-    $ui.Grid.DataSource = $null
-    $ui.Grid.DataSource = (ConvertTo-ReportTable $sec.Rows)
-    $ui.Info.Text = "$($sec.Description)   |   $(@($sec.Rows).Count) row(s), $($script:ReportKeys.Count) server(s). Double-click a row to open the server."
+function Get-ShortLcStatus($lc) {
+    if (-not $lc) { return 'No official date' }
+    switch -Wildcard ("$($lc.Status)") {
+        'EOL (paid ESU only)' { return 'Past end of support (ESU)' }
+        'EOL'                 { return 'Past end of support' }
+        'Extended*'           { return 'Extended support' }
+        'Supported (no EOL*'  { return 'Supported (no end date)' }
+        'Supported'           { return 'Supported' }
+        default               { return 'No official date' }
+    }
 }
 
-function Update-ReportsTab([bool]$refreshLifecycle = $false) {
-    $ui = $script:ReportsUi
-    if (-not $ui) { return }
-    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+function Get-ServerFacts([string]$key) {
+    $r   = $script:Results[$key]
+    if (-not $r) { return $null }
+    $inv = Get-Inv $r
+    $osLc = Get-Lc (Get-OsLifecycleKey $r)
+    $osName = if ($inv -and $inv.OS -and $inv.OS.Caption) { "$($inv.OS.Caption)" -replace '^Microsoft\s+', '' } else { ("$($r.OperatingSystem)" -replace '^Microsoft\s+', '' -replace '\s*\(.*$', '') }
+    $build  = if ($inv -and $inv.OS -and $inv.OS.Build) { "$($inv.OS.Build)$(if ($inv.OS.UBR) { ".$($inv.OS.UBR)" })" } elseif ("$($r.OperatingSystem)" -match 'build (\d+)') { $matches[1] } else { '' }
+
+    $dbs = @()
+    if ($inv) {
+        foreach ($db in @($inv.Databases | Where-Object { $_ })) {
+            $lc = Get-Lc (Get-DbLifecycleKey $db)
+            $dbs += [PSCustomObject]@{
+                Product = "$($db.Product)"; Version = "$($db.Version)"; Edition = "$($db.Edition)"; Instance = "$($db.Instance)"
+                IsEngine = ("$($db.Instance)" -ne '(no service)'); Installed = "$($db.InstallDate)"; Lc = $lc
+                Name = $(if ($lc -and $lc.Release) { "$($lc.Release)" } else { "$($db.Product) $($db.Version)" })
+            }
+        }
+    }
+    $certs = @()
+    if ($inv) {
+        foreach ($c in @($inv.Certificates | Where-Object { $_ })) {
+            $name = if (@($c.DnsNames | Where-Object { $_ }).Count) { "$(@($c.DnsNames)[0])" } elseif ($c.FriendlyName) { "$($c.FriendlyName)" } else { ("$($c.Subject)" -replace '^CN=', '' -replace ',.*$', '') }
+            $certs += [PSCustomObject]@{
+                Name = $name; Expires = ("$($c.NotAfter)" -split ' ')[0]; Days = (Get-DaysLeft $c.NotAfter)
+                InUse = (@($c.BoundTo | Where-Object { $_ }).Count -gt 0); BoundTo = @($c.BoundTo | Where-Object { $_ })
+                Issuer = ("$($c.Issuer)" -replace '^CN=', '' -replace ',.*$', '')
+            }
+        }
+    }
+    $iis = $null
+    if ($inv -and $inv.IIS -and $inv.IIS.Version) {
+        $iis = [PSCustomObject]@{ Version = "$($inv.IIS.Version)"; SiteCount = $inv.IIS.SiteCount; Sites = @($inv.IIS.Sites | Where-Object { $_ }); Lc = (Get-Lc (Get-IisLifecycleKey $r)) }
+    }
+    $disks = @(Get-DiskList $r)
+    $minDisk = $null
+    if ($disks.Count) { $minDisk = ($disks | Sort-Object FreePct | Select-Object -First 1) }
+    $uptime = $null
+    $boot = ConvertTo-LcDate (("$($r.LastRestartDate)" -split ' ')[0])
+    if ($boot) { $uptime = [int]((Get-Date).Date - $boot).TotalDays }
+
+    return [PSCustomObject]@{
+        Key = $key; R = $r; Inv = $inv; Groups = @(Get-EffectiveGroups $key $r)
+        OsName = $osName; Build = $build; OsLc = $osLc; OsStatus = (Get-ShortLcStatus $osLc)
+        Databases = $dbs; Certs = $certs; Iis = $iis; Disks = $disks; MinDisk = $minDisk; UptimeDays = $uptime
+    }
+}
+
+# ============================================================================
+# Risks for the Overview (Critical first). The Overview highlights; the
+# Report Builder output itself only shows what the user ticked.
+#   Critical: OS / DB past end of support (no paid ESU), certificate in use
+#             expired or expiring <= 14 days, a disk below 10 % free,
+#             unreachable at the last scan
+#   Warning : OS / DB in paid ESU or end of support <= 12 months, certificate
+#             in use expiring <= 60 days, a disk below 20 % free
+# ============================================================================
+$script:LastUnreachable = @()
+
+function Get-RiskItems {
+    $items = New-Object System.Collections.Generic.List[object]
+    $add = {
+        param($level, $key, $area, $item, $detail, $date)
+        $items.Add([PSCustomObject]@{ Level = $level; Server = $key; Area = $area; Item = $item; Detail = $detail; Date = $date })
+    }
+    foreach ($key in @($script:Results.Keys | Sort-Object)) {
+        $f = Get-ServerFacts $key
+        if (-not $f) { continue }
+        # Operating system
+        $lc = $f.OsLc
+        if ($lc) {
+            if ($lc.Status -eq 'EOL') { & $add 'Critical' $key 'OS' $f.OsName 'Past end of support' (Format-Day $lc.EOL) }
+            elseif ($lc.Status -eq 'EOL (paid ESU only)') { & $add 'Warning' $key 'OS' $f.OsName "Past end of support, paid ESU until $(Format-Day $lc.ESUEnd)" (Format-Day $lc.EOL) }
+            elseif ($null -ne $lc.DaysToEOL -and $lc.DaysToEOL -le 365) { & $add 'Warning' $key 'OS' $f.OsName "End of support in $($lc.DaysToEOL) days" (Format-Day $lc.EOL) }
+        }
+        # Database engines (packages without a service are not engines)
+        foreach ($db in @($f.Databases | Where-Object { $_.IsEngine })) {
+            $l = $db.Lc
+            if (-not $l) { continue }
+            if ($l.Status -eq 'EOL') { & $add 'Critical' $key 'Database' $db.Name 'Past end of support' (Format-Day $l.EOL) }
+            elseif ($l.Status -eq 'EOL (paid ESU only)') { & $add 'Warning' $key 'Database' $db.Name "Past end of support, paid ESU until $(Format-Day $l.ESUEnd)" (Format-Day $l.EOL) }
+            elseif ($null -ne $l.DaysToEOL -and $l.DaysToEOL -le 365) { & $add 'Warning' $key 'Database' $db.Name "End of support in $($l.DaysToEOL) days" (Format-Day $l.EOL) }
+        }
+        # Certificates bound to IIS
+        foreach ($c in @($f.Certs | Where-Object { $_.InUse -and $null -ne $_.Days })) {
+            $where = (@($c.BoundTo) -join ', ')
+            if ($c.Days -lt 0) { & $add 'Critical' $key 'Certificate' $c.Name "Expired $(-$c.Days) days ago - in use: $where" $c.Expires }
+            elseif ($c.Days -le 14) { & $add 'Critical' $key 'Certificate' $c.Name "Expires in $($c.Days) days - in use: $where" $c.Expires }
+            elseif ($c.Days -le 60) { & $add 'Warning' $key 'Certificate' $c.Name "Expires in $($c.Days) days - in use: $where" $c.Expires }
+        }
+        # Disks
+        foreach ($d in $f.Disks) {
+            $txt = "$($d.FreeGB) GB free of $($d.TotalGB) GB ($($d.FreePct)%)"
+            if ($d.FreePct -lt 10) { & $add 'Critical' $key 'Disk' $d.Drive $txt '' }
+            elseif ($d.FreePct -lt 20) { & $add 'Warning' $key 'Disk' $d.Drive $txt '' }
+        }
+    }
+    foreach ($u in @($script:LastUnreachable)) { & $add 'Critical' "$u".ToUpper() 'Scan' 'Unreachable' 'Not reachable at the last scan (WinRM)' '' }
+    $rank = @{ Critical = 0; Warning = 1 }
+    return @($items | Sort-Object { $rank[$_.Level] }, Area, Server)
+}
+
+# ============================================================================
+# Dark theme
+# ============================================================================
+function Set-DarkWindow($ctrl) {
+    if (-not $script:DarkNative) { return }
     try {
-        if ($refreshLifecycle) { $script:LifecycleRefreshed = $null }
-        Update-LifecycleIfStale
-        $script:ReportKeys     = Get-ReportServerKeys
-        $script:ReportSections = Get-ReportSections $script:ReportKeys
-        $prev = "$($ui.Combo.SelectedItem)" -replace '\s+\(\d+\)$', ''
-        $ui.Combo.BeginUpdate()
-        $ui.Combo.Items.Clear()
-        foreach ($n in $script:ReportSections.Keys) { [void]$ui.Combo.Items.Add("$n ($(@($script:ReportSections[$n].Rows).Count))") }
-        $ui.Combo.EndUpdate()
-        $idx = 0
-        for ($i = 0; $i -lt $ui.Combo.Items.Count; $i++) { if (("$($ui.Combo.Items[$i])" -replace '\s+\(\d+\)$', '') -eq $prev) { $idx = $i } }
-        if ($ui.Combo.Items.Count -gt 0) { $ui.Combo.SelectedIndex = $idx }   # triggers Show-ReportSection
-        $when = if ($script:LifecycleRefreshed) { $script:LifecycleRefreshed.ToString('yyyy-MM-dd HH:mm') } else { '-' }
-        Set-Status "Reports ready for $($script:ReportKeys.Count) server(s). Official lifecycle data checked: $when" $script:OkGreen
+        if ($ctrl -is [System.Windows.Forms.Form]) { [SwDark]::TitleBar($ctrl.Handle) }
+        else { [SwDark]::Scrollbars($ctrl.Handle) }
+    } catch {}
+}
+
+function Set-GridDark([System.Windows.Forms.DataGridView]$grid) {
+    $grid.BackgroundColor = $script:ThBg
+    $grid.GridColor = $script:ThLine
+    $grid.BorderStyle = 'None'
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.RowHeadersVisible = $false
+    $grid.CellBorderStyle = 'SingleHorizontal'
+    $grid.ColumnHeadersBorderStyle = 'None'
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $script:ThPanel
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $script:ThMuted
+    $grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $script:ThPanel
+    $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font($script:FontName, 8.5, [System.Drawing.FontStyle]::Bold)
+    $grid.ColumnHeadersHeight = 26
+    $grid.DefaultCellStyle.BackColor = $script:ThBg
+    $grid.DefaultCellStyle.ForeColor = $script:ThText
+    $grid.DefaultCellStyle.SelectionBackColor = $script:ThSelect
+    $grid.DefaultCellStyle.SelectionForeColor = $script:ThText
+    $grid.DefaultCellStyle.Font = New-Object System.Drawing.Font($script:FontName, 8.75)
+    $grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(2, 0, 2, 0)
+    $grid.AlternatingRowsDefaultCellStyle.BackColor = $script:ThAlt
+    $grid.RowTemplate.Height = 22
+    Set-DarkWindow $grid
+}
+
+# Walks a control tree and applies the palette. Controls that set their own
+# accent colours (blue buttons, coloured labels) keep them.
+function Set-DarkTheme($ctrl) {
+    try {
+        $t = $ctrl.GetType().Name
+        switch ($t) {
+            'Form'      { $ctrl.BackColor = $script:ThBg; $ctrl.ForeColor = $script:ThText; Set-DarkWindow $ctrl }
+            'TabPage'   { $ctrl.UseVisualStyleBackColor = $false; $ctrl.BackColor = $script:ThBg; $ctrl.ForeColor = $script:ThText }
+            'GroupBox'  { $ctrl.BackColor = $script:ThBg }
+            'Panel'     { if ($ctrl.BackColor -eq [System.Drawing.SystemColors]::Control -or $ctrl.BackColor -eq [System.Drawing.Color]::White) { $ctrl.BackColor = $script:ThBg }; $ctrl.ForeColor = $script:ThText }
+            'SplitContainer' { $ctrl.BackColor = $script:ThLine }
+            'TextBox'   { $ctrl.BackColor = $script:ThSurface; $ctrl.ForeColor = $script:ThText; $ctrl.BorderStyle = 'FixedSingle' }
+            'ComboBox'  { $ctrl.BackColor = $script:ThSurface; $ctrl.ForeColor = $script:ThText; $ctrl.FlatStyle = 'Flat' }
+            'NumericUpDown' { $ctrl.BackColor = $script:ThSurface; $ctrl.ForeColor = $script:ThText; $ctrl.BorderStyle = 'FixedSingle' }
+            'RichTextBox' { $ctrl.BackColor = $script:ThBg; $ctrl.ForeColor = $script:ThText; $ctrl.BorderStyle = 'None'; Set-DarkWindow $ctrl }
+            'TreeView'  { $ctrl.BackColor = $script:ThPanel; $ctrl.ForeColor = $script:ThText; $ctrl.BorderStyle = 'None'; $ctrl.LineColor = $script:ThMuted; Set-DarkWindow $ctrl }
+            'CheckedListBox' { $ctrl.BackColor = $script:ThPanel; $ctrl.ForeColor = $script:ThText; $ctrl.BorderStyle = 'None'; Set-DarkWindow $ctrl }
+            'ListBox'   { $ctrl.BackColor = $script:ThPanel; $ctrl.ForeColor = $script:ThText; $ctrl.BorderStyle = 'None' }
+            'DataGridView' { Set-GridDark $ctrl }
+            'Button' {
+                $ctrl.FlatStyle = 'Flat'
+                $ctrl.FlatAppearance.BorderColor = $script:ThLine
+                if ($ctrl.BackColor -ne $script:ThAccent) { $ctrl.BackColor = $script:ThSurface; $ctrl.ForeColor = $script:ThText }
+                else { $ctrl.FlatAppearance.BorderColor = $script:ThAccent; $ctrl.ForeColor = [System.Drawing.Color]::White }
+            }
+            'LinkLabel' { $ctrl.LinkColor = $script:ThAccent; $ctrl.ActiveLinkColor = $script:ThText; $ctrl.BackColor = [System.Drawing.Color]::Transparent }
+            'StatusStrip' { $ctrl.BackColor = $script:ThPanel; $ctrl.ForeColor = $script:ThText; $ctrl.SizingGrip = $false; $ctrl.RenderMode = 'System' }
+            default { }
+        }
+        if ($t -in 'Label', 'CheckBox', 'RadioButton') {
+            if ($ctrl.ForeColor -eq [System.Drawing.SystemColors]::ControlText -or $ctrl.ForeColor -eq $script:ThText) { $ctrl.ForeColor = $script:ThText }
+        }
+        foreach ($c in $ctrl.Controls) { Set-DarkTheme $c }
+    }
+    catch { Write-Log "Theme: $($ctrl.GetType().Name): $($_.Exception.Message)" }
+}
+
+# ============================================================================
+# Overview tab: risks first, then one compact row per server
+# ============================================================================
+function New-InfoLabel([string]$text, [int]$size = 9, [bool]$bold = $false) {
+    $l = New-Object System.Windows.Forms.Label
+    $l.AutoSize = $true; $l.Text = $text; $l.ForeColor = $script:ThText
+    $l.Font = New-Object System.Drawing.Font($script:FontName, $size, $(if ($bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
+    return $l
+}
+
+function New-DarkGrid {
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.Dock = 'Fill'; $g.ReadOnly = $true
+    $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false; $g.AllowUserToResizeRows = $false
+    $g.SelectionMode = 'FullRowSelect'; $g.MultiSelect = $false
+    $g.AutoSizeColumnsMode = 'None'
+    Set-DoubleBuffered $g
+    Set-GridDark $g
+    $g.Add_CellDoubleClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        try { $v = "$($s.Rows[$e.RowIndex].Cells['Server'].Value)"; if ($v) { Open-ServerTab $v } } catch {}
+    })
+    return $g
+}
+
+function Set-GridRows([System.Windows.Forms.DataGridView]$grid, [string[]]$cols, $rows, [hashtable]$widths) {
+    $grid.SuspendLayout()
+    $grid.Columns.Clear()
+    foreach ($c in $cols) {
+        $i = $grid.Columns.Add($c, $c)
+        $col = $grid.Columns[$i]
+        $col.SortMode = 'Automatic'
+        if ($widths.ContainsKey($c)) {
+            if ($widths[$c] -eq 0) { $col.AutoSizeMode = 'Fill' } else { $col.Width = $widths[$c] }
+        }
+        else { $col.Width = 110 }
+    }
+    foreach ($r in @($rows)) {
+        $vals = foreach ($c in $cols) { "$($r.$c)" }
+        [void]$grid.Rows.Add([object[]]@($vals))
+    }
+    $grid.ResumeLayout()
+}
+
+function Get-ToneColor([string]$text) {
+    if ($text -match '^(Critical|Past end of support$|Expired)') { return $script:ThBad }
+    if ($text -match '^(Warning|Past end of support \(ESU\)|Extended support)') { return $script:ThWarn }
+    if ($text -match '^Supported') { return $script:ThOk }
+    return $null
+}
+
+function Update-Overview {
+    $ui = $script:OverviewUi
+    if (-not $ui) { return }
+    try {
+        $risks = @(Get-RiskItems)
+        $crit  = @($risks | Where-Object { $_.Level -eq 'Critical' })
+        $warn  = @($risks | Where-Object { $_.Level -eq 'Warning' })
+        $keys  = @($script:Results.Keys | Sort-Object)
+        $osEol = 0; $dbEng = 0; $iisN = 0; $certSoon = 0
+        $profiles = foreach ($k in $keys) {
+            $f = Get-ServerFacts $k
+            if (-not $f) { continue }
+            if ($f.OsStatus -like 'Past*') { $osEol++ }
+            $eng = @($f.Databases | Where-Object { $_.IsEngine })
+            $dbEng += $eng.Count
+            if ($f.Iis) { $iisN++ }
+            $inUse = @($f.Certs | Where-Object { $_.InUse -and $null -ne $_.Days } | Sort-Object Days)
+            if ($inUse.Count -and $inUse[0].Days -le 60) { $certSoon++ }
+            $nRisk = @($risks | Where-Object { $_.Server -eq $k })
+            [PSCustomObject]@{
+                Server        = $k
+                Risks         = $(if ($nRisk.Count) { "$(@($nRisk | Where-Object Level -eq 'Critical').Count) crit / $(@($nRisk | Where-Object Level -eq 'Warning').Count) warn" } else { '' })
+                Roles         = (@($f.Groups) -join ', ')
+                OS            = $f.OsName
+                'OS support'  = $f.OsStatus
+                'End of support' = $(if ($f.OsLc) { Format-Day $f.OsLc.EOL } else { '' })
+                IIS           = $(if ($f.Iis) { "IIS $($f.Iis.Version) ($($f.Iis.SiteCount) sites)" } else { '' })
+                Databases     = ((@($eng | ForEach-Object { $_.Name }) | Sort-Object -Unique) -join ', ')
+                'Next cert expiry' = $(if ($inUse.Count) { "$($inUse[0].Expires) ($($inUse[0].Days) d)" } else { '' })
+                'Min disk free' = $(if ($f.MinDisk) { "$($f.MinDisk.Drive) $($f.MinDisk.FreePct)%" } else { '' })
+                Uptime        = $(if ($null -ne $f.UptimeDays) { "$($f.UptimeDays) d" } else { '' })
+            }
+        }
+        $ui.Kpi.Text = "$($keys.Count) servers    |    Critical: $($crit.Count)    Warning: $($warn.Count)    |    OS past end of support: $osEol    |    IIS: $iisN    Database engines: $dbEng    |    Certificates in use expiring <= 60 days: $certSoon"
+        $ui.RiskTitle.Text = if ($risks.Count) { "Risks ($($crit.Count) critical, $($warn.Count) warning) - double-click to open the server" } else { 'Risks: none found' }
+        Set-GridRows $ui.Risks @('Level', 'Server', 'Area', 'Item', 'Detail', 'Date') $risks @{ Level = 70; Server = 150; Area = 85; Item = 220; Detail = 0; Date = 85 }
+        Set-GridRows $ui.Profiles @('Server', 'Risks', 'Roles', 'OS', 'OS support', 'End of support', 'IIS', 'Databases', 'Next cert expiry', 'Min disk free', 'Uptime') @($profiles) @{ Server = 150; Risks = 95; Roles = 0; OS = 210; 'OS support' = 140; 'End of support' = 95; IIS = 120; Databases = 160; 'Next cert expiry' = 120; 'Min disk free' = 90; Uptime = 60 }
+        $when = if ($script:LifecycleRefreshed) { $script:LifecycleRefreshed.ToString('yyyy-MM-dd HH:mm') } else { 'not yet checked' }
+        $ui.Foot.Text = "Support dates: official vendor pages, checked $when. Critical = past end of support, in-use certificate expired or <= 14 days, disk < 10% free, unreachable. Warning = paid ESU or end of support <= 12 months, in-use certificate <= 60 days, disk < 20% free."
     }
     catch {
-        Write-Log "REPORTS TAB FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
-        Set-Status "Reports failed: $($_.Exception.Message) (see log)" ([System.Drawing.Color]::Red)
+        Write-Log "OVERVIEW FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        $ui.Kpi.Text = "Overview could not be built: $($_.Exception.Message) (see log)"
     }
-    finally { $form.Cursor = [System.Windows.Forms.Cursors]::Default }
 }
 
-function Open-ReportsTab {
-    if ($script:Results.Keys.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No inventory yet - run a scan first.", "Reports", "OK", "Information") | Out-Null
-        return
-    }
-    foreach ($t in $tabs.TabPages) {
-        if ($t.Text -eq 'Reports') { $tabs.SelectedTab = $t; Update-ReportsTab; return }
-    }
-    try {
-        $tp = New-Object System.Windows.Forms.TabPage ('Reports')
-        $tp.BackColor = [System.Drawing.Color]::White
+function Show-Overview([bool]$select = $true) {
+    if (-not $script:OverviewUi) {
+        $tp = New-Object System.Windows.Forms.TabPage ('Overview')
+        $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $script:ThBg
+        $root = New-Object System.Windows.Forms.TableLayoutPanel
+        $root.Dock = 'Fill'; $root.ColumnCount = 1; $root.RowCount = 5; $root.BackColor = $script:ThBg
+        $root.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 4)
+        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
+        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
+        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 38)))
+        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 62)))
+        [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
 
-        $bar = New-Object System.Windows.Forms.Panel
-        $bar.Dock = 'Top'; $bar.Height = 64; $bar.BackColor = $script:MerlinBlueLt
-
-        $lbl = New-Object System.Windows.Forms.Label
-        $lbl.Text = 'Report:'; $lbl.AutoSize = $true; $lbl.Location = New-Object System.Drawing.Point(10, 12)
-
-        $cmb = New-Object System.Windows.Forms.ComboBox
-        $cmb.DropDownStyle = 'DropDownList'
-        $cmb.Location = New-Object System.Drawing.Point(64, 8); $cmb.Size = New-Object System.Drawing.Size(300, 23)
-
-        $mk = {
-            param($text, $x, $w, $primary)
-            $b = New-Object System.Windows.Forms.Button
-            $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, 6); $b.Size = New-Object System.Drawing.Size($w, 28)
-            $b.FlatStyle = 'Flat'
-            if ($primary) { $b.BackColor = $script:MerlinBlue; $b.ForeColor = [System.Drawing.Color]::White }
-            else { $b.BackColor = $script:MerlinYellow; $b.ForeColor = $script:MerlinBlue }
-            return $b
-        }
-        $btnRefresh = & $mk 'Refresh (official sources)' 374 180 $true
-        $btnHtml    = & $mk 'Export HTML...' 562 120 $false
-        $btnCsv     = & $mk 'Export PDF...' 690 120 $false
-
-        $info = New-Object System.Windows.Forms.Label
-        $info.AutoSize = $false; $info.Location = New-Object System.Drawing.Point(10, 40)
-        $info.Size = New-Object System.Drawing.Size(1200, 20); $info.ForeColor = [System.Drawing.Color]::DimGray
-        $info.Anchor = 'Top,Left,Right'
-
-        $bar.Controls.AddRange(@($lbl, $cmb, $btnRefresh, $btnHtml, $btnCsv, $info))
-
-        $grid = New-Object System.Windows.Forms.DataGridView
-        $grid.Dock = 'Fill'
-        $grid.ReadOnly = $true
-        $grid.AllowUserToAddRows = $false
-        $grid.AllowUserToDeleteRows = $false
-        $grid.RowHeadersVisible = $false
-        $grid.SelectionMode = 'FullRowSelect'
-        $grid.AutoSizeColumnsMode = 'DisplayedCells'
-        $grid.BackgroundColor = [System.Drawing.Color]::White
-        $grid.BorderStyle = 'None'
-        $grid.EnableHeadersVisualStyles = $false
-        $grid.ColumnHeadersDefaultCellStyle.BackColor = $script:MerlinBlue
-        $grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-        $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
-        $grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 253)
-        Set-DoubleBuffered $grid
-
-        # Status colouring (same rules as the HTML report)
-        $grid.Add_CellFormatting({
+        $kpi = New-InfoLabel '' 9.5 $true
+        $kpi.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 6)
+        $riskTitle = New-InfoLabel 'Risks' 9 $true
+        $riskTitle.ForeColor = $script:ThAccent
+        $risks = New-DarkGrid
+        $risks.Add_CellFormatting({
             param($s, $e)
             try {
-                if ($e.RowIndex -lt 0 -or $s.Columns[$e.ColumnIndex].Name -ne 'Status') { return }
-                switch (Get-StatusClass "$($e.Value)") {
-                    'bad'  { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(253, 232, 231); $e.CellStyle.ForeColor = [System.Drawing.Color]::FromArgb(180, 35, 24) }
-                    'warn' { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 241, 214); $e.CellStyle.ForeColor = [System.Drawing.Color]::FromArgb(154, 91, 0) }
-                    'soon' { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 251, 214); $e.CellStyle.ForeColor = [System.Drawing.Color]::FromArgb(122, 106, 0) }
-                    'ok'   { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(227, 245, 234); $e.CellStyle.ForeColor = $script:OkGreen }
+                if ($s.Columns[$e.ColumnIndex].Name -eq 'Level') {
+                    $c = Get-ToneColor "$($e.Value)"
+                    if ($c) { $e.CellStyle.ForeColor = $c; $e.CellStyle.Font = New-Object System.Drawing.Font($script:FontName, 8.75, [System.Drawing.FontStyle]::Bold) }
                 }
             } catch {}
         })
-        $grid.Add_CellDoubleClick({
+        $profTitle = New-InfoLabel 'Server profiles' 9 $true
+        $profTitle.ForeColor = $script:ThAccent
+        $profiles = New-DarkGrid
+        $profiles.Add_CellFormatting({
             param($s, $e)
             try {
-                if ($e.RowIndex -lt 0 -or -not $s.Columns.Contains('Server')) { return }
-                $srv = "$($s.Rows[$e.RowIndex].Cells['Server'].Value)"
-                if ($srv) { Open-ServerTab $srv.ToUpper() }
-            } catch { Write-Log "Report row open failed: $($_.Exception.Message)" }
+                $n = $s.Columns[$e.ColumnIndex].Name
+                if ($n -eq 'OS support') { $c = Get-ToneColor "$($e.Value)"; if ($c) { $e.CellStyle.ForeColor = $c } }
+                elseif ($n -eq 'Risks' -and "$($e.Value)" -match '^[1-9]') { $e.CellStyle.ForeColor = $script:ThBad }
+                elseif ($n -eq 'Min disk free' -and "$($e.Value)" -match '\s([\d\.]+)%') {
+                    $p = [double]$matches[1]
+                    if ($p -lt 10) { $e.CellStyle.ForeColor = $script:ThBad } elseif ($p -lt 20) { $e.CellStyle.ForeColor = $script:ThWarn }
+                }
+            } catch {}
         })
+        $pRisk = New-Object System.Windows.Forms.Panel
+        $pRisk.Dock = 'Fill'; $pRisk.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+        $riskTitle.Dock = 'Top'; $pRisk.Controls.Add($risks); $pRisk.Controls.Add($riskTitle)
+        $pProf = New-Object System.Windows.Forms.Panel
+        $pProf.Dock = 'Fill'
+        $profTitle.Dock = 'Top'; $pProf.Controls.Add($profiles); $pProf.Controls.Add($profTitle)
+        $foot = New-InfoLabel '' 8
+        $foot.ForeColor = $script:ThMuted
+        $foot.MaximumSize = New-Object System.Drawing.Size(1400, 0)
 
-        $cmb.Add_SelectedIndexChanged({ try { Show-ReportSection } catch { Write-Log "Report section failed: $($_.Exception.Message)" } })
-        $btnRefresh.Add_Click({ Update-ReportsTab $true })
-        $btnHtml.Add_Click({ Invoke-RoleReport -Format Html })
-        $btnCsv.Add_Click({ Invoke-RoleReport -Format Pdf })
-
-        $tp.Controls.Add($grid)
-        $tp.Controls.Add($bar)      # added last = docked first (top)
-        [void]$tabs.TabPages.Add($tp)
-        $tabs.SelectedTab = $tp
-        $script:ReportsUi = @{ Tab = $tp; Combo = $cmb; Grid = $grid; Info = $info }
-        $tp.Add_Disposed({ $script:ReportsUi = $null })
-        Update-ReportsTab
+        $root.Controls.Add($kpi, 0, 0)
+        $root.Controls.Add((New-InfoLabel '' 2), 0, 1)
+        $root.Controls.Add($pRisk, 0, 2)
+        $root.Controls.Add($pProf, 0, 3)
+        $root.Controls.Add($foot, 0, 4)
+        $tp.Controls.Add($root)
+        $tabs.TabPages.Insert(0, $tp)
+        $script:OverviewUi = @{ Tab = $tp; Kpi = $kpi; RiskTitle = $riskTitle; Risks = $risks; Profiles = $profiles; Foot = $foot }
     }
-    catch {
-        Write-Log "OPEN REPORTS FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
-        [System.Windows.Forms.MessageBox]::Show("Reports could not be opened: $($_.Exception.Message)`n`nSee log: $script:LogFile",
-            "Reports", "OK", "Error") | Out-Null
-    }
-}
-
-$script:ReportText = @{
-    en = @{
-        title = 'Server Inventory Report'
-        generated = 'Generated {0} by {1} on {2}'
-        scope = 'Scope'
-        scope_all_roles = 'All roles'
-        servers_n = '{0} server(s)'
-        toc = 'Contents'
-        s_summary = 'Summary'
-        summary_note = 'Figures cover all servers in the report scope.'
-        k_servers = 'Servers'
-        k_roles = 'Role groups'
-        k_os = 'OS versions'
-        k_db = 'Database engines'
-        k_certs = 'Certificates'
-        d_roles = 'Servers per role'
-        d_os = 'Operating system versions'
-        d_db = 'Database products and versions'
-        d_status = 'Support status (operating systems, databases, IIS)'
-        d_certs = 'Certificates by expiry'
-        s_calendar = 'Lifecycle calendar: next 12 months'
-        cal_note = 'Vendor-published support dates and certificate expiry dates, by month.'
-        cal_none = 'No vendor support date and no certificate expiry falls within the next 12 months.'
-        ev_support = 'Mainstream support ends'
-        ev_eol = 'End of support (EOL)'
-        ev_esu = 'Paid extended security updates (ESU) end'
-        ev_cert = 'Certificate expires'
-        s_os = 'Operating systems'
-        s_db = 'Databases'
-        s_iis = 'IIS / Web'
-        s_roles = 'Role views'
-        s_certs = 'Certificates'
-        s_cards = 'Server details'
-        s_appendix = 'Sources and method'
-        s_evidence = 'Role classification'
-        c_server = 'Server'
-        c_roles = 'Roles'
-        c_os = 'Operating system'
-        c_build = 'Build'
-        c_installed = 'Installed'
-        c_restart = 'Last restart'
-        c_product = 'Product'
-        c_version = 'Version'
-        c_edition = 'Edition / instance'
-        c_mainstream = 'Mainstream support end'
-        c_support = 'Support end'
-        c_eol = 'End of support (EOL)'
-        c_esu = 'ESU end'
-        c_days = 'Time left'
-        c_status = 'Status'
-        c_source = 'Source'
-        c_state = 'Service'
-        c_sites = 'Sites'
-        c_expires = 'Expires'
-        c_issuer = 'Issuer'
-        c_inuse = 'In use'
-        c_name = 'Name'
-        c_count = 'Count'
-        c_date = 'Date'
-        c_event = 'Event'
-        c_group = 'Role group'
-        c_evidence = 'Evidence'
-        c_retrieved = 'Retrieved'
-        c_url = 'Official source'
-        c_ip = 'IP addresses'
-        c_ports = 'Listening ports'
-        c_rolesvc = 'Roles and role services'
-        c_features = 'Features'
-        c_policy = 'Lifecycle policy'
-        c_role_services = 'Role services'
-        yes = 'Yes'
-        no = 'No'
-        not_bound = 'Not bound in IIS'
-        st_supported = 'Supported'
-        st_extended = 'Extended support (security updates only)'
-        st_eol = 'End of support passed'
-        st_esu = 'End of support passed (paid ESU available)'
-        st_noeol = 'Supported (no end date announced)'
-        st_unknown = 'No official date found'
-        cs_expired = 'Expired'
-        cs_30 = 'Expires within 30 days'
-        cs_90 = 'Expires in 31-90 days'
-        cs_365 = 'Expires in 91-365 days'
-        cs_later = 'Valid for more than a year'
-        f_roles = 'Roles'
-        f_all = 'All'
-        f_dates = 'Only dates passed or within 90 days'
-        f_search = 'Search server, product, version, certificate...'
-        f_reset = 'Reset'
-        f_print = 'Print / PDF'
-        f_hint = 'Filters apply to the detail tables and server cards; the summary always covers the full report scope.'
-        m_dates = 'Support and end-of-support dates are read only from the vendors'' official pages when the report is created; every date is listed with its source and retrieval time below.'
-        m_approx = 'Install dates marked (approx.) are folder or binary creation times.'
-        m_certs = 'Certificates come from the LocalMachine\My and WebHosting stores; ''In use'' means the certificate is bound to an IIS site.'
-        m_readonly = 'Read-only inventory: no changes were made to any server.'
-        m_noeol = '''No end date announced'' means the vendor''s official page lists the version as supported without an end date.'
-        offline = 'offline copy of the official page'
-        approx = '(approx.)'
-        none = 'None detected'
-        in_days = 'in {0} days'
-        days_ago = '{0} days ago'
-        today = 'today'
-        rescan = 'Rescan with v1.5 or later for details'
-        more = 'and {0} more'
-        page_note = 'Server Wizard v{0}'
-    }
+    Update-Overview
+    if ($select) { $tabs.SelectedTab = $script:OverviewUi.Tab }
 }
 
 # ============================================================================
-# Readable report (v1.6): one model, rendered as a static, print-ready HTML
-# page (light JS only filters / sorts what is already on the page) and
-# printed to PDF with the local Edge / Chrome in headless mode.
-# The report only SHOWS facts: no advice, no scores. Every lifecycle date
-# carries its official source and retrieval time.
+# Report Builder: the user ticks groups, columns and (optional) conditions.
+# Nothing is pre-selected and a group never implies a filter or a column.
 # ============================================================================
-$script:RptLang = 'en'
-
-function T([string]$key) {
-    $d = $script:ReportText[$script:RptLang]
-    # Strings are stored ASCII-safe (&#NNN;) and returned as plain text;
-    # every value is HTML-encoded once where it is written into the page
-    $v = if ($d -and $d.ContainsKey($key)) { $d[$key] } else { $script:ReportText['en'][$key] }
-    return [Net.WebUtility]::HtmlDecode("$v")
-}
-function HE($v) { return [Net.WebUtility]::HtmlEncode("$v") }
-
-function Format-RptDate($d) {
-    if (-not $d) { return '' }
-    $dt = $null
-    if ($d -is [datetime]) { $dt = $d } else { $dt = ConvertTo-LcDate ((("$d" -split ' ')[0])) }
-    if (-not $dt) { return "$d" }
-    if ($script:RptLang -eq 'tr') { return $dt.ToString('dd.MM.yyyy') }
-    return $dt.ToString('yyyy-MM-dd')
-}
-function Get-SortKey($d) {
-    if (-not $d) { return '' }
-    $dt = if ($d -is [datetime]) { $d } else { ConvertTo-LcDate ((("$d" -split ' ')[0])) }
-    if ($dt) { return $dt.ToString('yyyyMMdd') }
-    return "$d"
-}
-function Format-RptDays($days) {
-    if ($null -eq $days -or "$days" -eq '') { return '' }
-    $n = [int]$days
-    if ($n -eq 0) { return (T 'today') }
-    if ($n -gt 0) { return ((T 'in_days') -f $n) }
-    return ((T 'days_ago') -f (-$n))
+function Join-Items($list) { return ((@($list) | Where-Object { "$_" -ne '' }) -join "`n") }
+function Get-FieldItems($r, [string]$name, [string]$sep) {
+    $p = $r.PSObject.Properties[$name]
+    if (-not $p -or -not "$($p.Value)") { return '' }
+    $v = "$($p.Value)"
+    if ($v -match '^(N/A|None)\b') { return $v }
+    if ($sep) { return (Join-Items ($v -split [regex]::Escape($sep) | ForEach-Object { "$_".Trim() })) }
+    return $v
 }
 
-# Neutral status key for an OS / DB / IIS lifecycle result
-function Get-StatusKey($lc) {
-    if (-not $lc) { return 'st_unknown' }
-    $s = "$($lc.Status)"
-    if ($s -like 'EOL (paid ESU*') { return 'st_esu' }
-    if ($s -like 'EOL*')           { return 'st_eol' }
-    if ($s -like 'Extended*')      { return 'st_extended' }
-    if ($s -like 'Supported (no*') { return 'st_noeol' }
-    if ($s -like 'Supported*')     { return 'st_supported' }
-    return 'st_unknown'
-}
-function Get-StatusTone([string]$key) {
-    switch ($key) {
-        'st_supported' { 'ok' }   'st_noeol' { 'ok' }   'cs_later' { 'ok' }   'cs_365' { 'ok' }
-        'st_extended'  { 'warn' } 'cs_90'    { 'soon' } 'cs_30'    { 'warn' }
-        'st_eol'       { 'bad' }  'st_esu'   { 'bad' }  'cs_expired' { 'bad' }
-        default        { 'mute' }
-    }
-}
-function Get-CertKey($days) {
-    if ($null -eq $days) { return 'st_unknown' }
-    if ($days -lt 0)   { return 'cs_expired' }
-    if ($days -le 30)  { return 'cs_30' }
-    if ($days -le 90)  { return 'cs_90' }
-    if ($days -le 365) { return 'cs_365' }
-    return 'cs_later'
-}
-# A row is "dated soon" when a shown date has passed or falls within 90 days
-function Test-Soon($days) { return ($null -ne $days -and "$days" -ne '' -and [int]$days -le 90) }
-
-function Get-OsShortName($r, $lc) {
-    if ($lc -and $lc.Product -and $lc.Product -notlike 'Windows build*') { return $lc.Product }
-    $inv = Get-Inv $r
-    $cap = if ($inv -and $inv.OS) { "$($inv.OS.Caption)" } else { ("$($r.OperatingSystem)" -replace '\s*\(.*$', '') }
-    return ($cap -replace '^Microsoft\s+', '' -replace '\s+(Standard|Datacenter|Essentials|Evaluation).*$', '')
+function Get-DbEolText($db) {
+    $t = 'no official date'
+    if ($db.Lc -and $db.Lc.EOL) { $t = Format-Day $db.Lc.EOL }
+    elseif ($db.Lc -and ([string]$db.Lc.Status) -like 'Supported (no EOL*') { $t = 'no end date announced' }
+    return "$($db.Name): $t"
 }
 
-# Builds everything the report shows, for the given servers and roles
-function Get-ReportModel([string[]]$keys, [string[]]$Roles = @()) {
-    $m = @{
-        Keys = $keys; Roles = @($Roles); Groups = [ordered]@{}; ServerGroups = @{}
-        Lifecycle = New-Object System.Collections.Generic.List[object]
-        Certs     = New-Object System.Collections.Generic.List[object]
-        Sources   = @{}
-    }
-    foreach ($g in $script:GroupOrder) { $m.Groups[$g] = New-Object System.Collections.Generic.List[string] }
-    foreach ($k in $keys) {
-        $gs = @(Get-EffectiveGroups $k $script:Results[$k] | Where-Object { @($Roles).Count -eq 0 -or $Roles -contains $_ })
-        $m.ServerGroups[$k] = $gs
-        foreach ($g in $gs) { if (-not $m.Groups.Contains($g)) { $m.Groups[$g] = New-Object System.Collections.Generic.List[string] }; $m.Groups[$g].Add($k) }
-    }
-    $addSrc = {
-        param($lc)
-        if ($lc -and $lc.Source -and -not $m.Sources.ContainsKey($lc.Source)) { $m.Sources[$lc.Source] = $lc.SourceNote }
-    }
-    foreach ($k in $keys) {
-        $r = $script:Results[$k]; $inv = Get-Inv $r
-        $osLc = Get-Lc (Get-OsLifecycleKey $r); & $addSrc $osLc
-        $m.Lifecycle.Add([PSCustomObject]@{
-            Server = $k; Category = 'OS'; Name = (Get-OsShortName $r $osLc); Version = $(if ($inv -and $inv.OS) { "$($inv.OS.Build)$(if ($inv.OS.UBR) { ".$($inv.OS.UBR)" })" } else { '' })
-            Edition = $(if ($inv -and $inv.OS) { "$($inv.OS.Caption)" } else { "$($r.OperatingSystem)" })
-            Installed = "$($r.InstallDate)"; Approx = $false; State = ''
-            Lc = $osLc; StatusKey = (Get-StatusKey $osLc)
-        })
-        if ($inv -and $inv.IIS) {
-            $iisLc = Get-Lc (Get-IisLifecycleKey $r); & $addSrc $iisLc
-            $m.Lifecycle.Add([PSCustomObject]@{
-                Server = $k; Category = 'IIS'; Name = "IIS $(("$($inv.IIS.Version)") -replace '\.0$', '')"; Version = "$($inv.IIS.VersionString)"
-                Edition = "$($inv.IIS.SiteCount) site(s)"; Installed = "$($inv.IIS.InstallDate)"; Approx = $true; State = ''
-                Lc = $iisLc; StatusKey = (Get-StatusKey $iisLc); Sites = @($inv.IIS.Sites | Where-Object { $_ })
-            })
+# Each column: Id, Category, Label, Get = { param($f) ... } -> text
+$script:ReportColumns = @(
+    @{ Id='roles';     Cat='General';      Label='Role groups';                 Get={ param($f) (@($f.Groups) -join ', ') } },
+    @{ Id='os';        Cat='General';      Label='Operating system';            Get={ param($f) $f.OsName } },
+    @{ Id='build';     Cat='General';      Label='OS build';                    Get={ param($f) $f.Build } },
+    @{ Id='osinst';    Cat='General';      Label='OS install date';             Get={ param($f) ("$($f.R.InstallDate)" -split ' ')[0] } },
+    @{ Id='restart';   Cat='General';      Label='Last restart';                Get={ param($f) "$($f.R.LastRestartDate)" } },
+    @{ Id='uptime';    Cat='General';      Label='Uptime (days)';               Get={ param($f) "$($f.UptimeDays)" } },
+    @{ Id='domain';    Cat='General';      Label='Domain';                      Get={ param($f) "$($f.R.Domain)" } },
+    @{ Id='ip';        Cat='General';      Label='IP addresses';                Get={ param($f) Get-FieldItems $f.R 'IPAddresses' '; ' } },
+    @{ Id='ossup';     Cat='OS lifecycle'; Label='OS support status';           Get={ param($f) $f.OsStatus } },
+    @{ Id='osmain';    Cat='OS lifecycle'; Label='OS mainstream support end';   Get={ param($f) if ($f.OsLc) { Format-Day $f.OsLc.SupportEnd } } },
+    @{ Id='oseol';     Cat='OS lifecycle'; Label='OS end of support (EOL)';     Get={ param($f) if ($f.OsLc) { Format-Day $f.OsLc.EOL } } },
+    @{ Id='osesu';     Cat='OS lifecycle'; Label='OS paid ESU end';             Get={ param($f) if ($f.OsLc) { Format-Day $f.OsLc.ESUEnd } } },
+    @{ Id='osdays';    Cat='OS lifecycle'; Label='OS days to EOL';              Get={ param($f) if ($f.OsLc) { "$($f.OsLc.DaysToEOL)" } } },
+    @{ Id='ossrc';     Cat='OS lifecycle'; Label='OS lifecycle source';         Get={ param($f) if ($f.OsLc) { "$($f.OsLc.Source)" } } },
+    @{ Id='cpu';       Cat='Hardware';     Label='CPU';                         Get={ param($f) "$($f.R.CPU)" } },
+    @{ Id='cores';     Cat='Hardware';     Label='Logical cores';               Get={ param($f) "$($f.R.LogicalCores)" } },
+    @{ Id='ram';       Cat='Hardware';     Label='RAM (GB)';                    Get={ param($f) "$($f.R.TotalRAM_GB)" } },
+    @{ Id='disks';     Cat='Disks';        Label='Disks (free / total)';        Get={ param($f) Join-Items (@($f.Disks) | ForEach-Object { "$($_.Drive) $($_.FreeGB) / $($_.TotalGB) GB ($($_.FreePct)% free)" }) } },
+    @{ Id='diskmin';   Cat='Disks';        Label='Lowest free space (%)';       Get={ param($f) if ($f.MinDisk) { "$($f.MinDisk.Drive) $($f.MinDisk.FreePct)%" } } },
+    @{ Id='diskfree';  Cat='Disks';        Label='Free space (GB, all drives)'; Get={ param($f) if (@($f.Disks).Count) { "$([math]::Round((@($f.Disks) | Measure-Object FreeGB -Sum).Sum, 1))" } } },
+    @{ Id='iisver';    Cat='IIS';          Label='IIS version';                 Get={ param($f) if ($f.Iis) { "IIS $($f.Iis.Version)" } } },
+    @{ Id='iissites';  Cat='IIS';          Label='IIS sites';                   Get={ param($f) if ($f.Iis) { Join-Items $f.Iis.Sites } } },
+    @{ Id='iisdns';    Cat='IIS';          Label='Site DNS names';              Get={ param($f) Get-FieldItems $f.R 'SiteDNSNames' '; ' } },
+    @{ Id='iisssl';    Cat='IIS';          Label='SSL bindings';                Get={ param($f) Get-FieldItems $f.R 'SSLBindings' ' ;; ' } },
+    @{ Id='iiseol';    Cat='IIS';          Label='IIS end of support';          Get={ param($f) if ($f.Iis -and $f.Iis.Lc) { Format-Day $f.Iis.Lc.EOL } } },
+    @{ Id='dbprod';    Cat='Database';     Label='Database engines and versions'; Get={ param($f) Join-Items (@($f.Databases | Where-Object { $_.IsEngine }) | ForEach-Object { "$($_.Product) $($_.Version)$(if ($_.Edition) { " - $($_.Edition)" })" }) } },
+    @{ Id='dbinst';    Cat='Database';     Label='Database install date';       Get={ param($f) Join-Items (@($f.Databases | Where-Object { $_.IsEngine }) | ForEach-Object { "$($_.Product): $($_.Installed)" }) } },
+    @{ Id='dbsup';     Cat='Database';     Label='Database support status';     Get={ param($f) Join-Items (@($f.Databases | Where-Object { $_.IsEngine }) | ForEach-Object { "$($_.Name): $(Get-ShortLcStatus $_.Lc)" }) } },
+    @{ Id='dbeol';     Cat='Database';     Label='Database end of support (EOL)'; Get={ param($f) Join-Items (@($f.Databases | Where-Object { $_.IsEngine }) | ForEach-Object { Get-DbEolText $_ }) } },
+    @{ Id='dbclient';  Cat='Database';     Label='Database client packages';    Get={ param($f) Join-Items (@($f.Databases | Where-Object { -not $_.IsEngine }) | ForEach-Object { "$($_.Product) $($_.Version)" }) } },
+    @{ Id='sqlinst';   Cat='Database';     Label='SQL instances (detailed)';    Get={ param($f) Get-FieldItems $f.R 'SQLInstanceDetails' ' | ' } },
+    @{ Id='certuse';   Cat='Certificates'; Label='Certificates in use (expiry)'; Get={ param($f) Join-Items (@($f.Certs | Where-Object { $_.InUse } | Sort-Object Days) | ForEach-Object { "$($_.Name) - $($_.Expires) ($($_.Days) d)" }) } },
+    @{ Id='certall';   Cat='Certificates'; Label='All certificates (expiry)';   Get={ param($f) Join-Items (@($f.Certs | Sort-Object Days) | ForEach-Object { "$($_.Name) - $($_.Expires) ($($_.Days) d)$(if ($_.InUse) { ' in use' })" }) } },
+    @{ Id='certnext';  Cat='Certificates'; Label='Next in-use expiry';          Get={ param($f) $c = @($f.Certs | Where-Object { $_.InUse -and $null -ne $_.Days } | Sort-Object Days); if ($c.Count) { "$($c[0].Expires) ($($c[0].Days) d)" } } },
+    @{ Id='winroles';  Cat='Roles and software'; Label='Windows roles and role services'; Get={ param($f) Get-FieldItems $f.R 'RolesDetail' ' ;; ' } },
+    @{ Id='winfeat';   Cat='Roles and software'; Label='Windows features';      Get={ param($f) Get-FieldItems $f.R 'FeaturesDetail' ' ;; ' } },
+    @{ Id='3psvc';     Cat='Roles and software'; Label='3rd party services (running)'; Get={ param($f) Get-FieldItems $f.R 'ThirdPartyServices' '; ' } },
+    @{ Id='3psw';      Cat='Roles and software'; Label='3rd party software';    Get={ param($f) Get-FieldItems $f.R 'ThirdPartyProducts' '; ' } },
+    @{ Id='mssw';      Cat='Roles and software'; Label='Microsoft products';    Get={ param($f) Get-FieldItems $f.R 'MicrosoftProducts' '; ' } },
+    @{ Id='autosvc';   Cat='Roles and software'; Label='Automatic services';    Get={ param($f) Get-FieldItems $f.R 'AutomaticServices' '; ' } },
+    @{ Id='ports';     Cat='Roles and software'; Label='Listening TCP ports';   Get={ param($f) "$($f.R.ListeningPorts)" } },
+    @{ Id='rdp';       Cat='Roles and software'; Label='Last RDP logons';       Get={ param($f) Get-FieldItems $f.R 'LastRDPLogons' ' | ' } }
+)
+
+# Optional conditions; a server is listed when it matches ALL (or ANY) ticked ones
+$script:ReportFilters = @(
+    @{ Id='disk20';  Label='A disk below 20% free';                   Test={ param($f) @($f.Disks | Where-Object { $_.FreePct -lt 20 }).Count -gt 0 } },
+    @{ Id='disk10';  Label='A disk below 10% free';                   Test={ param($f) @($f.Disks | Where-Object { $_.FreePct -lt 10 }).Count -gt 0 } },
+    @{ Id='oseol';   Label='OS past end of support';                  Test={ param($f) $f.OsLc -and "$($f.OsLc.Status)" -like 'EOL*' } },
+    @{ Id='oseol12'; Label='OS end of support within 12 months';      Test={ param($f) $f.OsLc -and $null -ne $f.OsLc.DaysToEOL -and $f.OsLc.DaysToEOL -ge 0 -and $f.OsLc.DaysToEOL -le 365 } },
+    @{ Id='dbeol';   Label='Database past end of support';            Test={ param($f) @($f.Databases | Where-Object { $_.IsEngine -and $_.Lc -and "$($_.Lc.Status)" -like 'EOL*' }).Count -gt 0 } },
+    @{ Id='hasdb';   Label='Has a database engine';                   Test={ param($f) @($f.Databases | Where-Object { $_.IsEngine }).Count -gt 0 } },
+    @{ Id='hasiis';  Label='Has IIS';                                 Test={ param($f) $null -ne $f.Iis } },
+    @{ Id='cert30';  Label='Certificate in use expires within 30 days (or expired)'; Test={ param($f) @($f.Certs | Where-Object { $_.InUse -and $null -ne $_.Days -and $_.Days -le 30 }).Count -gt 0 } },
+    @{ Id='cert90';  Label='Certificate in use expires within 90 days (or expired)'; Test={ param($f) @($f.Certs | Where-Object { $_.InUse -and $null -ne $_.Days -and $_.Days -le 90 }).Count -gt 0 } },
+    @{ Id='uptime30'; Label='Not restarted for 30+ days';             Test={ param($f) $null -ne $f.UptimeDays -and $f.UptimeDays -ge 30 } }
+)
+
+# Builds the report data: one section per ticked group (or one table)
+function Get-BuilderData {
+    param([string[]]$Groups, [string[]]$Columns, [string[]]$Filters = @(), [bool]$MatchAll = $true,
+          [bool]$OneTable = $false, [string[]]$Servers = @())
+    $cols = @($script:ReportColumns | Where-Object { $Columns -contains $_.Id })
+    $flts = @($script:ReportFilters | Where-Object { $Filters -contains $_.Id })
+    $pool = if (@($Servers).Count) { @($Servers | Where-Object { $script:Results.ContainsKey($_) }) } else { @($script:Results.Keys) }
+    $sections = [ordered]@{}
+    if ($OneTable) { $sections['All selected groups'] = New-Object System.Collections.Generic.List[object] }
+    else { foreach ($g in $Groups) { $sections[$g] = New-Object System.Collections.Generic.List[object] } }
+    $seen = @{}
+    foreach ($key in @($pool | Sort-Object)) {
+        $f = Get-ServerFacts $key
+        if (-not $f) { continue }
+        $hit = @($f.Groups | Where-Object { $Groups -contains $_ })
+        if ($hit.Count -eq 0) { continue }
+        if ($flts.Count) {
+            $res = @(foreach ($x in $flts) { [bool](& $x.Test $f) })
+            $ok = if ($MatchAll) { -not ($res -contains $false) } else { $res -contains $true }
+            if (-not $ok) { continue }
         }
-        if ($inv) {
-            foreach ($db in @($inv.Databases | Where-Object { $_ })) {
-                $lc = Get-Lc (Get-DbLifecycleKey $db); & $addSrc $lc
-                $nm = if ($lc -and $lc.Release) { $lc.Release } else { "$($db.Product)" }
-                $m.Lifecycle.Add([PSCustomObject]@{
-                    Server = $k; Category = 'DB'; Name = $nm; Product = "$($db.Product)"; Version = "$($db.Version)"
-                    Edition = (@("$($db.Edition)", "$($db.Instance)") | Where-Object { $_ }) -join ' / '
-                    Installed = "$($db.InstallDate)"; Approx = ("$($db.InstallDateSource)" -match 'approx|creation'); State = "$($db.ServiceState)"
-                    Lc = $lc; StatusKey = $(if ($lc) { Get-StatusKey $lc } else { 'st_unknown' })
-                })
-            }
-            foreach ($c in @($inv.Certificates | Where-Object { $_ })) {
-                $days = Get-DaysLeft $c.NotAfter
-                $name = if (@($c.DnsNames | Where-Object { $_ }).Count) { @($c.DnsNames)[0] } elseif ($c.FriendlyName) { $c.FriendlyName } else { ($c.Subject -replace '^CN=', '' -replace ',.*$', '') }
-                $m.Certs.Add([PSCustomObject]@{
-                    Server = $k; Name = $name; Subject = $c.Subject; Issuer = ($c.Issuer -replace '^CN=', '' -replace ',.*$', '')
-                    Expires = $c.NotAfter; Days = $days; Key = (Get-CertKey $days); InUse = @($c.BoundTo | Where-Object { $_ })
-                    Store = $c.Store; SelfSigned = $c.SelfSigned; Sans = @($c.DnsNames | Where-Object { $_ })
-                })
-            }
+        $row = [ordered]@{ Server = $key }
+        if ($OneTable) { $row['Groups'] = ($hit -join ', ') }
+        foreach ($c in $cols) {
+            $v = ''
+            try { $v = "$(& $c.Get $f)" } catch { $v = '' }
+            $row[$c.Label] = $v
         }
+        if ($OneTable) { if (-not $seen.ContainsKey($key)) { $sections['All selected groups'].Add([PSCustomObject]$row); $seen[$key] = $true } }
+        else { foreach ($g in $hit) { $sections[$g].Add([PSCustomObject]$row) } }
     }
-    return $m
+    # Plain arrays (a generic List inside @() fails on some PowerShell builds)
+    foreach ($k in @($sections.Keys)) { $sections[$k] = [object[]]$sections[$k].ToArray() }
+    return @{ Sections = $sections; Columns = @($cols | ForEach-Object { $_.Label }); Filters = @($flts | ForEach-Object { $_.Label }); OneTable = $OneTable }
 }
 
-function Get-RolesAttr($m, [string]$server) { return (HE ((@($m.ServerGroups[$server]) -join '|'))) }
+$script:BuilderCss = @'
+*{box-sizing:border-box}html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{font-family:'Segoe UI',Arial,sans-serif;font-size:12px;color:#1d2433;margin:0;background:#fff}
+header{padding:14px 22px 10px;border-bottom:2px solid #1f3a93}
+h1{font-size:18px;margin:0 0 4px;color:#1f3a93}
+.meta{color:#5f6b7a;font-size:11px;line-height:1.5}.meta b{color:#1d2433;font-weight:600}
+main{padding:4px 22px 18px}
+h2{font-size:14px;color:#1f3a93;margin:16px 0 6px}h2 span{color:#5f6b7a;font-weight:400;font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:11px}
+th{background:#eef2fc;color:#1d2433;text-align:left;vertical-align:bottom;padding:5px 7px;border-bottom:1px solid #c8d1e6;cursor:pointer;min-width:60px}
+td{padding:4px 7px;border-bottom:1px solid #e3e7ee;vertical-align:top;white-space:pre-line;overflow-wrap:anywhere}
+table.wide{font-size:9.5px}table.wide td,table.wide th{padding:3px 4px}
+td:first-child{font-weight:600;white-space:nowrap}
+tr:nth-child(even) td{background:#fafbfd}
+.empty{color:#5f6b7a;font-style:italic;padding:4px 0}
+footer{color:#5f6b7a;font-size:10px;padding:6px 22px 16px;border-top:1px solid #e3e7ee}
+@page{size:A4 landscape;margin:10mm}
+@media print{body{font-size:10px}table{font-size:9.5px}table.wide{font-size:7.5px}th{cursor:default}thead{display:table-header-group}tr{break-inside:avoid}h2{break-after:avoid}}
+'@
 
-# --- small HTML builders ------------------------------------------------------
-function New-RptBars($title, $pairs, [string]$toneMap = '') {
-    # $pairs: ordered dictionary label -> count (labels are trusted/encoded by caller)
-    $max = 0; foreach ($v in $pairs.Values) { if ($v -gt $max) { $max = $v } }
+$script:BuilderJs = @'
+(function(){var ths=document.querySelectorAll("th");Array.prototype.forEach.call(ths,function(th){th.addEventListener("click",function(){
+var tb=th.closest("table").tBodies[0],i=Array.prototype.indexOf.call(th.parentNode.children,th),d=th.getAttribute("data-d")==="1"?-1:1;
+Array.prototype.forEach.call(th.parentNode.children,function(x){x.removeAttribute("data-d");});th.setAttribute("data-d",d===1?"1":"0");
+var rows=Array.prototype.slice.call(tb.rows);rows.sort(function(a,b){var x=a.cells[i].textContent,y=b.cells[i].textContent,nx=parseFloat(x),ny=parseFloat(y);
+if(!isNaN(nx)&&!isNaN(ny)&&/^-?[\d.]/.test(x)&&/^-?[\d.]/.test(y))return(nx-ny)*d;return x.localeCompare(y)*d;});rows.forEach(function(r){tb.appendChild(r);});});});})();
+'@
+
+function ConvertTo-BuilderHtml($data, [string[]]$Groups, [string]$serverScope) {
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append("<div class=""panel""><h3>$title</h3>")
-    if ($pairs.Count -eq 0) { [void]$sb.Append("<p class=""muted"">$(T 'none')</p></div>"); return $sb.ToString() }
-    [void]$sb.Append('<table class="bars">')
-    foreach ($k in $pairs.Keys) {
-        $v = $pairs[$k]; $w = if ($max -gt 0) { [math]::Max(2, [math]::Round(100 * $v / $max)) } else { 0 }
-        $tone = 'blue'
-        if ($toneMap -and $k -match '^<span data-tone="(\w+)"') { $tone = $matches[1] }
-        [void]$sb.Append("<tr><td class=""bl"">$k</td><td class=""bb""><span class=""bar $tone"" style=""width:$w%""></span></td><td class=""bn"">$v</td></tr>")
-    }
-    [void]$sb.Append('</table></div>')
-    return $sb.ToString()
-}
-
-function New-RptTable([string[]]$headers, $rows, [string]$id) {
-    # $rows: list of @{ Attrs = '...'; Cells = @( @{ H = html; S = sortkey; C = class } ) }
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append("<div class=""tw""><table class=""grid"" id=""$id""><thead><tr>")
-    foreach ($h in $headers) { [void]$sb.Append("<th>$h</th>") }
-    [void]$sb.Append('</tr></thead><tbody>')
-    foreach ($row in $rows) {
-        [void]$sb.Append("<tr $($row.Attrs)>")
-        foreach ($c in $row.Cells) {
-            $cls = if ($c.C) { " class=""$($c.C)""" } else { '' }
-            $srt = if ($null -ne $c.S -and "$($c.S)" -ne '') { " data-sort=""$(HE $c.S)""" } else { '' }
-            [void]$sb.Append("<td$cls$srt>$($c.H)</td>")
-        }
-        [void]$sb.Append('</tr>')
-    }
-    [void]$sb.Append('</tbody></table></div>')
-    if (@($rows).Count -eq 0) { return "<p class=""muted"">$(T 'none')</p>" }
-    return $sb.ToString()
-}
-function Cell($html, $sort = $null, $cls = $null) { return @{ H = $html; S = $sort; C = $cls } }
-function StatusCell([string]$key) { return (Cell "<span class=""pill $(Get-StatusTone $key)"">$(T $key)</span>" $key) }
-function SrcCell($lc) {
-    if (-not $lc -or -not $lc.Source) { return (Cell '') }
-    $u = "$($lc.Source)"
-    if ($u -match '^https://([^/]+)/' -and $script:OfficialHosts -contains $matches[1]) {
-        return (Cell "<a href=""$(HE $u)"" target=""_blank"" rel=""noopener"">$(HE $matches[1])</a>")
-    }
-    return (Cell (HE $u))
-}
-function DaysCell($days) { return (Cell (HE (Format-RptDays $days)) $(if ($null -ne $days -and "$days" -ne '') { [int]$days + 100000 } else { '' }) 'nw') }
-function DateCell($d) { return (Cell (HE (Format-RptDate $d)) (Get-SortKey $d) 'nw') }
-
-function New-LcRow($m, $it, [switch]$WithServer) {
-    $lc = $it.Lc
-    $days = if ($lc) { $lc.DaysToEOL } else { $null }
-    $inst = (Format-RptDate $it.Installed)
-    if ($inst -and $it.Approx) { $inst += " $(T 'approx')" }
-    $cells = @()
-    if ($WithServer) { $cells += (Cell "<b>$(HE $it.Server)</b>" $it.Server) }
-    $cells += (Cell (HE $it.Name))
-    $cells += (Cell (HE $it.Version) $it.Version 'nw')
-    $cells += (Cell (HE $it.Edition))
-    $cells += (Cell (HE $inst) (Get-SortKey $it.Installed) 'nw')
-    $cells += (DateCell $(if ($lc) { $lc.SupportEnd }))
-    $cells += (DateCell $(if ($lc) { $lc.EOL }))
-    $cells += (DaysCell $days)
-    $cells += (StatusCell $it.StatusKey)
-    $cells += (SrcCell $lc)
-    $soon = if (Test-Soon $days) { '1' } else { '0' }
-    return @{ Attrs = "data-roles=""$(Get-RolesAttr $m $it.Server)"" data-soon=""$soon"""; Cells = $cells }
-}
-
-function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText = '') {
-    $script:RptLang = if ($lang -eq 'tr') { 'tr' } else { 'en' }
     $now = Get-Date
-    $sb  = New-Object System.Text.StringBuilder
-    $lcHeaders = @((T 'c_product'), (T 'c_version'), (T 'c_edition'), (T 'c_installed'), (T 'c_support'), (T 'c_eol'), (T 'c_days'), (T 'c_status'), (T 'c_source'))
-    $os  = @($m.Lifecycle | Where-Object { $_.Category -eq 'OS' })
-    $dbs = @($m.Lifecycle | Where-Object { $_.Category -eq 'DB' })
-    $iis = @($m.Lifecycle | Where-Object { $_.Category -eq 'IIS' })
-    $groupsUsed = @($m.Groups.Keys | Where-Object { $m.Groups[$_].Count -gt 0 })
-
-    # ---- head + toolbar ---------------------------------------------------
-    [void]$sb.Append("<!DOCTYPE html><html lang=""$($script:RptLang)""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width, initial-scale=1"">")
-    [void]$sb.Append("<title>$(T 'title')</title><style>$($script:ReportCss)</style></head><body>")
-    $by = "$env:USERDOMAIN\$env:USERNAME"
-    [void]$sb.Append("<header class=""cover""><div><h1>$(T 'title')</h1>")
-    [void]$sb.Append("<p>$((T 'generated') -f (HE $now.ToString($(if ($script:RptLang -eq 'tr') { 'dd.MM.yyyy HH:mm' } else { 'yyyy-MM-dd HH:mm' }))), (HE $by), (HE $env:COMPUTERNAME))</p>")
-    [void]$sb.Append("<p><b>$(T 'scope'):</b> $(HE $scopeText) &middot; $((T 'servers_n') -f $m.Keys.Count)</p></div>")
-    [void]$sb.Append("<div class=""brand"">$((T 'page_note') -f (HE $script:AppVersion))</div></header>")
-
-    [void]$sb.Append('<div class="fbar noprint"><div class="row"><span class="lbl">' + (T 'f_roles') + '</span>')
-    [void]$sb.Append("<button type=""button"" class=""chip"" data-role="""" aria-pressed=""true"">$(T 'f_all')</button>")
-    foreach ($g in $groupsUsed) { [void]$sb.Append("<button type=""button"" class=""chip"" data-role=""$(HE $g)"" aria-pressed=""false"">$(HE $g) <span class=""n"">$($m.Groups[$g].Count)</span></button>") }
-    [void]$sb.Append('</div><div class="row">')
-    [void]$sb.Append("<button type=""button"" class=""chip"" id=""soon"" aria-pressed=""false"">$(T 'f_dates')</button>")
-    [void]$sb.Append("<input type=""search"" id=""q"" placeholder=""$(T 'f_search')"">")
-    [void]$sb.Append("<button type=""button"" class=""btn"" id=""reset"">$(T 'f_reset')</button><button type=""button"" class=""btn pri"" id=""print"">$(T 'f_print')</button>")
-    [void]$sb.Append("<span class=""hint"">$(T 'f_hint')</span></div></div><main>")
-
-    # ---- TOC ----------------------------------------------------------------
-    $toc = [ordered]@{ summary = (T 's_summary'); calendar = (T 's_calendar'); os = (T 's_os') }
-    if ($dbs.Count) { $toc['db'] = (T 's_db') }
-    if ($iis.Count) { $toc['iis'] = (T 's_iis') }
-    $toc['roles'] = (T 's_roles'); $toc['certs'] = (T 's_certs'); $toc['cards'] = (T 's_cards'); $toc['appendix'] = (T 's_appendix')
-    [void]$sb.Append("<nav class=""toc""><b>$(T 'toc')</b>")
-    $n = 0; foreach ($k in $toc.Keys) { $n++; [void]$sb.Append("<a href=""#$k"">$n. $($toc[$k])</a>") }
-    [void]$sb.Append('</nav>')
-
-    # ---- 1. Summary -----------------------------------------------------------
-    $osNames = [ordered]@{}; foreach ($o in ($os | Sort-Object Name)) { $l = HE $o.Name; if (-not $osNames.Contains($l)) { $osNames[$l] = 0 }; $osNames[$l]++ }
-    $dbNames = [ordered]@{}; foreach ($d in ($dbs | Sort-Object Name, Version)) {
-        $l = HE $(if ($d.Lc -and $d.Lc.Release) { $d.Lc.Release } else { "$($d.Product) $((("$($d.Version)" -split '\.')[0..1]) -join '.')" })
-        if (-not $dbNames.Contains($l)) { $dbNames[$l] = 0 }; $dbNames[$l]++ }
-    $kpi = @(
-        @((T 'k_servers'), $m.Keys.Count), @((T 'k_roles'), $groupsUsed.Count), @((T 'k_os'), $osNames.Count),
-        @((T 'k_db'), $dbs.Count), @((T 'k_certs'), $m.Certs.Count)
-    )
-    [void]$sb.Append("<section id=""summary""><h2>1. $(T 's_summary')</h2><p class=""muted"">$(T 'summary_note')</p><div class=""kpis"">")
-    foreach ($k in $kpi) { [void]$sb.Append("<div class=""kpi""><b>$($k[1])</b><span>$($k[0])</span></div>") }
-    [void]$sb.Append('</div><div class="panels">')
-    $rolePairs = [ordered]@{}; foreach ($g in $groupsUsed) { $rolePairs[(HE $g)] = $m.Groups[$g].Count }
-    [void]$sb.Append((New-RptBars (T 'd_roles') $rolePairs))
-    [void]$sb.Append((New-RptBars (T 'd_os') $osNames))
-    [void]$sb.Append((New-RptBars (T 'd_db') $dbNames))
-    $stPairs = [ordered]@{}
-    foreach ($sk in 'st_supported', 'st_noeol', 'st_extended', 'st_esu', 'st_eol', 'st_unknown') {
-        $c = @($m.Lifecycle | Where-Object { $_.StatusKey -eq $sk }).Count
-        if ($c) { $stPairs["<span data-tone=""$(Get-StatusTone $sk)"">$(T $sk)</span>"] = $c }
-    }
-    [void]$sb.Append((New-RptBars (T 'd_status') $stPairs 'tone'))
-    $cPairs = [ordered]@{}
-    foreach ($ck in 'cs_expired', 'cs_30', 'cs_90', 'cs_365', 'cs_later') {
-        $c = @($m.Certs | Where-Object { $_.Key -eq $ck }).Count
-        if ($c) { $cPairs["<span data-tone=""$(Get-StatusTone $ck)"">$(T $ck)</span>"] = $c }
-    }
-    [void]$sb.Append((New-RptBars (T 'd_certs') $cPairs 'tone'))
-    [void]$sb.Append('</div></section>')
-
-    # ---- 2. Calendar (next 12 months) -------------------------------------------
-    $start = New-Object DateTime -ArgumentList $now.Year, $now.Month, 1
-    $end   = $start.AddMonths(12)
-    $events = New-Object System.Collections.Generic.List[object]
-    $addEv = {
-        param($date, $evKey, $name, $server)
-        if ($date -and $date -ge $start -and $date -lt $end) { $events.Add([PSCustomObject]@{ Date = ([datetime]$date).Date; Ev = $evKey; Name = $name; Server = $server }) }
-    }
-    foreach ($it in $m.Lifecycle) {
-        if (-not $it.Lc) { continue }
-        if ($it.Lc.SupportEnd -and $it.Lc.EOL -and ([datetime]$it.Lc.SupportEnd).Date -ne ([datetime]$it.Lc.EOL).Date) { & $addEv $it.Lc.SupportEnd 'ev_support' $it.Name $it.Server }
-        & $addEv $it.Lc.EOL 'ev_eol' $it.Name $it.Server
-        & $addEv $it.Lc.ESUEnd 'ev_esu' $it.Name $it.Server
-    }
-    foreach ($c in $m.Certs) { $d = ConvertTo-LcDate ((("$($c.Expires)" -split ' ')[0])); & $addEv $d 'ev_cert' $c.Name $c.Server }
-    $culture = if ($script:RptLang -eq 'tr') { [Globalization.CultureInfo]::GetCultureInfo('tr-TR') } else { [Globalization.CultureInfo]::GetCultureInfo('en-US') }
-    [void]$sb.Append("<section id=""calendar"" class=""pb""><h2>2. $(T 's_calendar')</h2><p class=""muted"">$(T 'cal_note')</p><div class=""cal"">")
-    for ($i = 0; $i -lt 12; $i++) {
-        $ms = $start.AddMonths($i); $me = $ms.AddMonths(1)
-        $mev = @($events | Where-Object { $_.Date -ge $ms -and $_.Date -lt $me })
-        if ($mev.Count -eq 0) { continue }
-        [void]$sb.Append("<div class=""mon""><h4>$(HE $culture.TextInfo.ToTitleCase($ms.ToString('MMMM yyyy', $culture)))</h4>")
-        if ($mev.Count -eq 0) { continue }
-        [void]$sb.Append('<ul>')
-        foreach ($grp in ($mev | Group-Object Date, Ev, Name | Sort-Object { $_.Group[0].Date }, { $_.Group[0].Name })) {
-            $e0 = $grp.Group[0]
-            $srvs = @($grp.Group | ForEach-Object { $_.Server } | Sort-Object -Unique)
-            $roles = HE ((@($srvs | ForEach-Object { $m.ServerGroups[$_] } | ForEach-Object { $_ } | Sort-Object -Unique)) -join '|')
-            $list = if ($srvs.Count -le 6) { $srvs -join ', ' } else { (($srvs[0..5]) -join ', ') + ' ' + ((T 'more') -f ($srvs.Count - 6)) }
-            $tone = if ($e0.Ev -eq 'ev_cert') { 'cert' } else { 'lc' }
-            [void]$sb.Append("<li data-roles=""$roles"" data-soon=""1"" class=""$tone""><span class=""dd"">$(HE (Format-RptDate $e0.Date))</span> <b>$(HE $e0.Name)</b> &middot; $(T $e0.Ev)<br><span class=""muted"">$(HE $list)</span></li>")
+    [void]$sb.Append('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Server Report</title>')
+    [void]$sb.Append("<style>$($script:BuilderCss)</style></head><body><header><h1>Server Report</h1><div class=""meta"">")
+    [void]$sb.Append("<b>Generated:</b> $(HE $now.ToString('yyyy-MM-dd HH:mm')) by $(HE "$env:USERDOMAIN\$env:USERNAME") on $(HE $env:COMPUTERNAME) &middot; Server Wizard v$(HE $script:AppVersion)<br>")
+    [void]$sb.Append("<b>Groups:</b> $(HE ($Groups -join ', ')) &middot; <b>Servers:</b> $(HE $serverScope)<br>")
+    [void]$sb.Append("<b>Columns:</b> $(HE ((@('Server') + $data.Columns) -join ', '))")
+    if (@($data.Filters).Count) { [void]$sb.Append("<br><b>Conditions:</b> $(HE ($data.Filters -join $(if ($data.MatchAll) { ' AND ' } else { ' OR ' })))") }
+    [void]$sb.Append('</div></header><main>')
+    $total = 0
+    foreach ($name in $data.Sections.Keys) {
+        $rows = @($data.Sections[$name])
+        $total += $rows.Count
+        [void]$sb.Append("<h2>$(HE $name) <span>&middot; $($rows.Count) server(s)</span></h2>")
+        if ($rows.Count -eq 0) { [void]$sb.Append('<div class="empty">No server matches.</div>'); continue }
+        $heads = @($rows[0].PSObject.Properties.Name)
+        [void]$sb.Append($(if ($heads.Count -gt 12) { '<table class="wide"><thead><tr>' } else { '<table><thead><tr>' }))
+        foreach ($h in $heads) { [void]$sb.Append("<th>$(HE $h)</th>") }
+        [void]$sb.Append('</tr></thead><tbody>')
+        foreach ($r in $rows) {
+            [void]$sb.Append('<tr>')
+            foreach ($h in $heads) { [void]$sb.Append("<td>$(HE $r.$h)</td>") }
+            [void]$sb.Append('</tr>')
         }
-        [void]$sb.Append('</ul></div>')
+        [void]$sb.Append('</tbody></table>')
     }
-    [void]$sb.Append('</div>')
-    if ($events.Count -eq 0) { [void]$sb.Append("<p>$(T 'cal_none')</p>") }
-    [void]$sb.Append('</section>')
-
-    # ---- 3. Operating systems -------------------------------------------------
-    $sec = 3
-    [void]$sb.Append("<section id=""os""><h2>$sec. $(T 's_os')</h2>")
-    $rows = foreach ($it in ($os | Sort-Object Name, Server)) {
-        $r = $script:Results[$it.Server]
-        $lc = $it.Lc
-        $days = if ($lc) { $lc.DaysToEOL } else { $null }
-        @{ Attrs = "data-roles=""$(Get-RolesAttr $m $it.Server)"" data-soon=""$(if (Test-Soon $days) { '1' } else { '0' })"""
-           Cells = @((Cell "<b>$(HE $it.Server)</b>" $it.Server), (Cell (HE (@($m.ServerGroups[$it.Server]) -join ', '))), (Cell (HE $it.Name)),
-                     (Cell (HE $it.Version) $it.Version 'nw'), (DateCell $it.Installed), (DateCell "$($r.LastRestartDate)"),
-                     (DateCell $(if ($lc) { $lc.SupportEnd })), (DateCell $(if ($lc) { $lc.EOL })), (DateCell $(if ($lc) { $lc.ESUEnd })),
-                     (DaysCell $days), (StatusCell $it.StatusKey), (SrcCell $lc)) }
-    }
-    [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_roles'), (T 'c_os'), (T 'c_build'), (T 'c_installed'), (T 'c_restart'), (T 'c_mainstream'), (T 'c_eol'), (T 'c_esu'), (T 'c_days'), (T 'c_status'), (T 'c_source')) @($rows) 't-os'))
-    [void]$sb.Append('</section>')
-
-    # ---- 4. Databases ------------------------------------------------------------
-    if ($dbs.Count) {
-        $sec++
-        [void]$sb.Append("<section id=""db""><h2>$sec. $(T 's_db')</h2>")
-        $rows = foreach ($it in ($dbs | Sort-Object Product, Version, Server)) { New-LcRow $m $it -WithServer }
-        [void]$sb.Append((New-RptTable (@((T 'c_server')) + $lcHeaders) @($rows) 't-db'))
-        [void]$sb.Append('</section>')
-    }
-    # ---- 5. IIS -------------------------------------------------------------------
-    if ($iis.Count) {
-        $sec++
-        [void]$sb.Append("<section id=""iis""><h2>$sec. $(T 's_iis')</h2>")
-        $rows = foreach ($it in ($iis | Sort-Object Name, Server)) {
-            $row = New-LcRow $m $it -WithServer
-            $row.Cells[3] = (Cell (HE ((@($it.Sites) -join ', '))))
-            $row
-        }
-        $h = @((T 'c_server')) + $lcHeaders; $h[3] = (T 'c_sites')
-        [void]$sb.Append((New-RptTable $h @($rows) 't-iis'))
-        [void]$sb.Append('</section>')
-    }
-
-    # ---- Role views ----------------------------------------------------------------
-    $sec++
-    [void]$sb.Append("<section id=""roles""><h2>$sec. $(T 's_roles')</h2>")
-    foreach ($g in $groupsUsed) {
-        $def = $script:RoleDefs | Where-Object { $_.Group -eq $g } | Select-Object -First 1
-        [void]$sb.Append("<div class=""rolev"" data-roles=""$(HE $g)""><h3>$(HE $g) <span class=""muted"">&middot; $((T 'servers_n') -f $m.Groups[$g].Count)</span></h3>")
-        $rows = foreach ($k in ($m.Groups[$g] | Sort-Object)) {
-            $r = $script:Results[$k]; $inv = Get-Inv $r
-            $osIt = $os | Where-Object { $_.Server -eq $k } | Select-Object -First 1
-            $svc = ''
-            if ($g -eq 'SQL / Database') {
-                $svc = (@($dbs | Where-Object { $_.Server -eq $k } | ForEach-Object { "$($_.Product) $($_.Version)" }) -join ', ')
-            } elseif ($g -eq 'IIS / Web') {
-                $svc = (@($iis | Where-Object { $_.Server -eq $k } | ForEach-Object { "$($_.Name): $((@($_.Sites) -join ', '))" }) -join ', ')
-            } elseif ($inv -and $def -and $def.Features) {
-                $svc = (@(Get-FeatureRows $inv $def | ForEach-Object { $_.DisplayName }) -join ', ')
-            } else { $svc = "$($r.ThirdPartyServices)" }
-            $days = if ($osIt -and $osIt.Lc) { $osIt.Lc.DaysToEOL } else { $null }
-            @{ Attrs = "data-roles=""$(HE $g)"" data-soon=""$(if (Test-Soon $days) { '1' } else { '0' })"""
-               Cells = @((Cell "<b>$(HE $k)</b>" $k), (Cell (HE $svc)), (Cell (HE $(if ($osIt) { $osIt.Name }))),
-                         (DateCell $(if ($osIt -and $osIt.Lc) { $osIt.Lc.EOL })), (StatusCell $(if ($osIt) { $osIt.StatusKey } else { 'st_unknown' }))) }
-        }
-        [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_role_services'), (T 'c_os'), (T 'c_eol'), (T 'c_status')) @($rows) ("t-role-" + ($g -replace '[^A-Za-z0-9]', ''))))
-        [void]$sb.Append('</div>')
-    }
-    [void]$sb.Append('</section>')
-
-    # ---- Certificates ------------------------------------------------------------------
-    $sec++
-    [void]$sb.Append("<section id=""certs""><h2>$sec. $(T 's_certs')</h2>")
-    $rows = foreach ($c in ($m.Certs | Sort-Object @{ Expression = { if ($null -eq $_.Days) { [int]::MaxValue } else { $_.Days } } }, Server)) {
-        $use = if ($c.InUse.Count) { (T 'yes') + ': ' + (HE ($c.InUse -join ', ')) } else { (T 'no') }
-        @{ Attrs = "data-roles=""$(Get-RolesAttr $m $c.Server)"" data-soon=""$(if (Test-Soon $c.Days) { '1' } else { '0' })"""
-           Cells = @((Cell "<b>$(HE $c.Server)</b>" $c.Server), (Cell ("$(HE $c.Name)" + $(if ($c.Sans.Count -gt 1) { "<br><span class=""muted"">$(HE (($c.Sans | Select-Object -Skip 1) -join ', '))</span>" } else { '' }))),
-                     (Cell (HE $c.Issuer)), (DateCell $c.Expires), (DaysCell $c.Days), (Cell $use $(if ($c.InUse.Count) { '1' } else { '0' })), (StatusCell $c.Key), (Cell (HE $c.Store))) }
-    }
-    [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_name'), (T 'c_issuer'), (T 'c_expires'), (T 'c_days'), (T 'c_inuse'), (T 'c_status'), (T 'c_store')) @($rows) 't-certs'))
-    [void]$sb.Append('</section>')
-
-    # ---- Server cards ---------------------------------------------------------------------
-    $sec++
-    [void]$sb.Append("<section id=""cards"" class=""pb""><h2>$sec. $(T 's_cards')</h2>")
-    foreach ($k in ($m.Keys | Sort-Object)) {
-        $r = $script:Results[$k]; $inv = Get-Inv $r
-        $osIt = $os | Where-Object { $_.Server -eq $k } | Select-Object -First 1
-        $soon = @($m.Lifecycle | Where-Object { $_.Server -eq $k -and $_.Lc -and (Test-Soon $_.Lc.DaysToEOL) }).Count + @($m.Certs | Where-Object { $_.Server -eq $k -and (Test-Soon $_.Days) }).Count
-        [void]$sb.Append("<article class=""card"" id=""srv-$(HE $k)"" data-roles=""$(Get-RolesAttr $m $k)"" data-soon=""$(if ($soon) { '1' } else { '0' })"">")
-        [void]$sb.Append("<div class=""ch""><h3>$(HE $k)</h3><div>")
-        foreach ($g in @($m.ServerGroups[$k])) { [void]$sb.Append("<span class=""tag"">$(HE $g)</span>") }
-        [void]$sb.Append('</div></div><dl class="kv">')
-        $kv = [ordered]@{}
-        $kv[(T 'c_os')]        = HE ("$(if ($osIt) { $osIt.Edition }) $(if ($osIt -and $osIt.Version) { "($(T 'c_build') $($osIt.Version))" })")
-        $kv[(T 'c_installed')] = HE (Format-RptDate "$($r.InstallDate)")
-        $kv[(T 'c_restart')]   = HE (Format-RptDate "$($r.LastRestartDate)")
-        if ($osIt -and $osIt.Lc) {
-            $kv[(T 'c_mainstream')] = HE (Format-RptDate $osIt.Lc.SupportEnd)
-            $kv[(T 'c_eol')]        = "$(HE (Format-RptDate $osIt.Lc.EOL)) <span class=""pill $(Get-StatusTone $osIt.StatusKey)"">$(T $osIt.StatusKey)</span>"
-        }
-        $kv[(T 'c_ip')]    = HE ("$($r.IPAddresses)" -replace ';\s*', ', ')
-        $kv[(T 'c_ports')] = HE ("$($r.ListeningPorts)")
-        if ($inv) {
-            $roleTxt = @($inv.Features | Where-Object { $_ -and $_.Type -eq 'Role' } | ForEach-Object {
-                $role = $_
-                $svcs = @($inv.Features | Where-Object { $_ -and $_.Type -eq 'Role Service' -and $_.Parent -eq $role.Name } | ForEach-Object { $_.DisplayName })
-                "$($role.DisplayName)" + $(if ($svcs) { " ($($svcs -join ', '))" } else { '' })
-            })
-            $kv[(T 'c_rolesvc')] = if ($roleTxt) { HE ($roleTxt -join '; ') } else { T 'none' }
-            $feat = @($inv.Features | Where-Object { $_ -and $_.Type -eq 'Feature' -and $_.Depth -le 1 } | ForEach-Object { $_.DisplayName })
-            $kv[(T 'c_features')] = if ($feat) { HE ($feat -join ', ') } else { T 'none' }
-        } else { $kv[(T 'c_rolesvc')] = T 'rescan' }
-        foreach ($kk in $kv.Keys) { [void]$sb.Append("<dt>$kk</dt><dd>$($kv[$kk])</dd>") }
-        [void]$sb.Append('</dl>')
-        $prod = @($m.Lifecycle | Where-Object { $_.Server -eq $k -and $_.Category -ne 'OS' })
-        if ($prod.Count) {
-            $rows = foreach ($it in $prod) { New-LcRow $m $it }
-            [void]$sb.Append((New-RptTable $lcHeaders @($rows) "t-card-$(HE $k)-p"))
-        }
-        $cs = @($m.Certs | Where-Object { $_.Server -eq $k } | Sort-Object Days)
-        if ($cs.Count) {
-            $rows = foreach ($c in $cs) {
-                @{ Attrs = "data-soon=""$(if (Test-Soon $c.Days) { '1' } else { '0' })"""
-                   Cells = @((Cell (HE $c.Name)), (DateCell $c.Expires), (DaysCell $c.Days), (Cell $(if ($c.InUse.Count) { (T 'yes') + ': ' + (HE ($c.InUse -join ', ')) } else { T 'no' })), (StatusCell $c.Key)) }
-            }
-            [void]$sb.Append((New-RptTable @((T 'c_name'), (T 'c_expires'), (T 'c_days'), (T 'c_inuse'), (T 'c_status')) @($rows) "t-card-$(HE $k)-c"))
-        }
-        [void]$sb.Append('</article>')
-    }
-    [void]$sb.Append('</section>')
-
-    # ---- Appendix: sources, method, classification ---------------------------------------
-    $sec++
-    [void]$sb.Append("<section id=""appendix"" class=""pb""><h2>$sec. $(T 's_appendix')</h2><ul class=""method"">")
-    foreach ($mk in 'm_dates', 'm_noeol', 'm_approx', 'm_certs', 'm_readonly') { [void]$sb.Append("<li>$(T $mk)</li>") }
-    [void]$sb.Append('</ul>')
-    $rows = foreach ($u in ($m.Sources.Keys | Sort-Object)) {
-        $note = "$($m.Sources[$u])"
-        $when = if ($note -match '(\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?)') { $matches[1] } else { $note }
-        $txt  = HE $when
-        if ($note -match 'offline') { $txt += " &middot; $(T 'offline')" }
-        @{ Attrs = ''; Cells = @((Cell "<a href=""$(HE $u)"" target=""_blank"" rel=""noopener"">$(HE $u)</a>"), (Cell $txt $when 'nw')) }
-    }
-    [void]$sb.Append((New-RptTable @((T 'c_url'), (T 'c_retrieved')) @($rows) 't-src'))
-    [void]$sb.Append("<h3>$(T 's_evidence')</h3>")
-    $rows = foreach ($k in ($m.Keys | Sort-Object)) {
-        if ($script:Overrides.ContainsKey($k)) {
-            @{ Attrs = "data-roles=""$(Get-RolesAttr $m $k)"""; Cells = @((Cell (HE $k) $k), (Cell (HE $script:Overrides[$k])), (Cell 'Manual override')) }
-            continue
-        }
-        foreach ($d in @(Get-RoleGroupDetails $script:Results[$k])) {
-            if (@($m.Roles).Count -and $m.Roles -notcontains $d.Group) { continue }
-            @{ Attrs = "data-roles=""$(HE $d.Group)"""; Cells = @((Cell (HE $k) $k), (Cell (HE $d.Group)), (Cell (HE $d.Reason))) }
-        }
-    }
-    [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_group'), (T 'c_evidence')) @($rows) 't-evidence'))
-    [void]$sb.Append("</section></main><footer>$((T 'page_note') -f (HE $script:AppVersion)) &middot; $(T 'm_readonly')</footer>")
-    [void]$sb.Append("<script>$($script:ReportJs)</script></body></html>")
+    [void]$sb.Append("</main><footer>Read-only inventory: nothing was changed on any server. Support and end-of-support dates are read from the vendors' official lifecycle pages.</footer>")
+    [void]$sb.Append("<script>$($script:BuilderJs)</script></body></html>")
     return $sb.ToString()
 }
-
-$script:ReportCss = @'
-:root{--blue:#1f3a93;--blue-lt:#eef2fc;--ink:#1d2433;--muted:#5f6b7a;--line:#dde2ea;--row:#fafbfd;
---ok:#1e7b4b;--ok-bg:#e5f4ec;--warn:#9a5b00;--warn-bg:#fff1d6;--soon:#7a6a00;--soon-bg:#fff9cf;--bad:#a8261b;--bad-bg:#fbe6e4;--mute:#5f6b7a;--mute-bg:#eef0f3}
-*{box-sizing:border-box}
-html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
-body{font-family:'Segoe UI',Arial,sans-serif;color:var(--ink);margin:0;background:#fff;font-size:13px;line-height:1.45}
-.cover{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;background:var(--blue-lt);border-bottom:3px solid var(--blue);padding:22px 32px}
-.cover h1{margin:0 0 6px;color:var(--blue);font-size:26px}
-.cover p{margin:2px 0;color:var(--muted)} .brand{color:var(--blue);font-weight:600;white-space:nowrap}
-.fbar{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid var(--line);padding:10px 32px;box-shadow:0 2px 6px rgba(31,58,147,.06)}
-.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center} .row+.row{margin-top:8px}
-.lbl{font-size:12px;color:var(--muted);min-width:46px}
-.chip{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:999px;padding:4px 12px;font:inherit;font-size:12.5px;cursor:pointer}
-.chip:hover{border-color:var(--blue)} .chip[aria-pressed=true]{background:var(--blue);border-color:var(--blue);color:#fff}
-.chip .n{opacity:.7;font-size:11px;margin-left:3px}
-input[type=search]{border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit;width:300px;max-width:100%}
-.btn{border:1px solid var(--blue);background:#fff;color:var(--blue);border-radius:6px;padding:5px 12px;font:inherit;font-size:12.5px;cursor:pointer}
-.btn.pri{background:var(--blue);color:#fff} .hint{font-size:11.5px;color:var(--muted);margin-left:6px}
-main{padding:6px 32px 32px;max-width:1500px}
-.toc{display:flex;flex-wrap:wrap;gap:6px 16px;margin:16px 0 4px;font-size:13px} .toc a{color:var(--blue);text-decoration:none} .toc a:hover{text-decoration:underline}
-section{margin-top:28px} h2{color:var(--blue);font-size:19px;margin:0 0 4px;padding-bottom:5px;border-bottom:2px solid var(--blue-lt)}
-h3{font-size:14.5px;margin:16px 0 6px;color:var(--ink)} .muted{color:var(--muted)}
-.kpis{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
-.kpi{border:1px solid var(--line);border-radius:8px;padding:10px 18px;min-width:140px} .kpi b{display:block;font-size:26px;color:var(--blue)} .kpi span{font-size:12px;color:var(--muted)}
-.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px}
-.panel{border:1px solid var(--line);border-radius:8px;padding:10px 14px;break-inside:avoid} .panel h3{margin:2px 0 8px;font-size:13.5px}
-table.bars{width:100%;border-collapse:collapse} .bars td{padding:3px 4px;font-size:12px;vertical-align:middle}
-.bl{width:46%} .bb{width:44%} .bn{width:10%;text-align:right;font-weight:600}
-.bar{display:block;height:10px;border-radius:5px;background:var(--blue)} .bar.ok{background:var(--ok)} .bar.warn{background:#d08a1a} .bar.soon{background:#c4b100} .bar.bad{background:var(--bad)} .bar.mute{background:#9aa4b2}
-.cal{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
-.mon{border:1px solid var(--line);border-radius:8px;padding:8px 12px;break-inside:avoid} .mon h4{margin:0 0 6px;color:var(--blue);font-size:13px}
-.mon ul{margin:0;padding:0;list-style:none} .mon li{padding:5px 0 5px 8px;border-left:3px solid var(--blue);margin:4px 0;font-size:12px}
-.mon li.cert{border-left-color:#d08a1a} .dd{font-weight:600;font-variant-numeric:tabular-nums}
-.tw{overflow-x:auto;border:1px solid var(--line);border-radius:6px;margin:6px 0 4px}
-table.grid{border-collapse:collapse;width:100%;font-size:12px}
-.grid th{background:var(--blue);color:#fff;text-align:left;padding:7px 8px;white-space:nowrap;cursor:pointer;user-select:none}
-.grid th .ar{font-size:9px;margin-left:4px} .grid td{border-top:1px solid var(--line);padding:5px 8px;vertical-align:top}
-.grid tr:nth-child(even) td{background:var(--row)} .nw{white-space:nowrap} .grid td:first-child{white-space:nowrap}
-.grid td a{color:var(--blue)}
-.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap}
-.pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.warn{background:var(--warn-bg);color:var(--warn)} .pill.soon{background:var(--soon-bg);color:var(--soon)}
-.pill.bad{background:var(--bad-bg);color:var(--bad)} .pill.mute{background:var(--mute-bg);color:var(--mute)}
-.card{border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:12px 0;break-inside:avoid}
-.ch{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px} .ch h3{margin:0;color:var(--blue);font-size:15px}
-.tag{display:inline-block;background:var(--blue-lt);color:var(--blue);border-radius:4px;padding:1px 7px;font-size:11.5px;margin:2px 0 2px 4px}
-dl.kv{display:grid;grid-template-columns:200px 1fr;gap:3px 14px;margin:10px 0} dl.kv dt{color:var(--muted)} dl.kv dd{margin:0}
-ul.method{padding-left:18px} ul.method li{margin:3px 0}
-.hidden{display:none!important} mark{background:#fff3a3;padding:0}
-footer{color:var(--muted);font-size:11px;padding:8px 32px 24px;border-top:1px solid var(--line)}
-@page{size:A4 landscape;margin:12mm}
-@media print{.noprint{display:none!important}body{font-size:11px}.cover{padding:14px 18px}main{padding:0 6px;max-width:none}
-section.pb{break-before:page}h2,h3,h4{break-after:avoid}.panels,.kpis{break-inside:avoid}.tw{overflow:visible;border:none}.grid th{background:var(--blue)!important}thead{display:table-header-group}tr{break-inside:avoid}.card{break-inside:avoid}}
-'@
-
-$script:ReportJs = @'
-(function(){"use strict";
-var S={roles:[],soon:false,q:""};
-function $(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));}
-function rolesOk(el){if(!S.roles.length)return true;var a=el.getAttribute("data-roles");if(a===null)return true;
- var rs=a.split("|");for(var i=0;i<rs.length;i++)if(S.roles.indexOf(rs[i])>=0)return true;return false;}
-function soonOk(el){if(!S.soon)return true;var s=el.getAttribute("data-soon");return s===null||s==="1";}
-function textOk(el){if(!S.q)return true;return el.textContent.toLowerCase().indexOf(S.q)>=0;}
-function apply(){
- $("[data-roles],[data-soon]").forEach(function(el){if(el.closest(".fbar"))return;
-  var show=rolesOk(el)&&soonOk(el)&&(el.tagName==="TR"||el.tagName==="LI"||el.tagName==="ARTICLE"?textOk(el):true);
-  el.classList.toggle("hidden",!show);});
- $(".mon").forEach(function(m){var any=$("li",m).some(function(li){return !li.classList.contains("hidden");});m.classList.toggle("hidden",(S.roles.length||S.soon||S.q)&&!any);});
- $(".chip[data-role]").forEach(function(b){var r=b.getAttribute("data-role");b.setAttribute("aria-pressed",String(r===""?S.roles.length===0:S.roles.indexOf(r)>=0));});
- document.getElementById("soon").setAttribute("aria-pressed",String(S.soon));
- var h=[];if(S.roles.length)h.push("roles="+S.roles.map(encodeURIComponent).join(","));if(S.soon)h.push("soon=1");
- try{history.replaceState(null,"",h.length?"#"+h.join("&"):location.pathname+location.search);}catch(e){}}
-$(".chip[data-role]").forEach(function(b){b.addEventListener("click",function(e){var g=b.getAttribute("data-role");
- if(g===""){S.roles=[];}else{var i=S.roles.indexOf(g);if(e.ctrlKey||e.metaKey||e.shiftKey){if(i>=0)S.roles.splice(i,1);else S.roles.push(g);}else{S.roles=(S.roles.length===1&&i===0)?[]:[g];}}
- apply();});});
-document.getElementById("soon").addEventListener("click",function(){S.soon=!S.soon;apply();});
-var q=document.getElementById("q"),t;q.addEventListener("input",function(){clearTimeout(t);t=setTimeout(function(){S.q=q.value.trim().toLowerCase();apply();},180);});
-document.getElementById("reset").addEventListener("click",function(){S={roles:[],soon:false,q:""};q.value="";apply();});
-document.getElementById("print").addEventListener("click",function(){window.print();});
-$("table.grid").forEach(function(tb){$("th",tb).forEach(function(th,ci){th.title="Sort";th.addEventListener("click",function(){
- var body=tb.tBodies[0],rows=Array.prototype.slice.call(body.rows),dir=th.getAttribute("data-dir")==="1"?-1:1;
- $("th",tb).forEach(function(x){x.removeAttribute("data-dir");var a=x.querySelector(".ar");if(a)a.remove();});
- th.setAttribute("data-dir",dir===1?"1":"-1");var ar=document.createElement("span");ar.className="ar";ar.textContent=dir===1?"\u25B2":"\u25BC";th.appendChild(ar);
- function key(r){var c=r.cells[ci];if(!c)return"";var s=c.getAttribute("data-sort");return s!==null?s:c.textContent.trim();}
- rows.sort(function(a,b){var x=key(a),y=key(b);if(x===""&&y!=="")return 1;if(y===""&&x!=="")return -1;
-  if(/^-?\d+(\.\d+)?$/.test(x)&&/^-?\d+(\.\d+)?$/.test(y))return dir*(parseFloat(x)-parseFloat(y));
-  return dir*x.localeCompare(y,undefined,{numeric:true,sensitivity:"base"});});
- rows.forEach(function(r){body.appendChild(r);});});});});
-(function(){var h=location.hash.replace(/^#/,"");if(!h)return;h.split("&").forEach(function(p){var kv=p.split("=");
- if(kv[0]==="roles"&&kv[1])S.roles=kv[1].split(",").map(decodeURIComponent);if(kv[0]==="soon")S.soon=kv[1]==="1";});})();
-apply();
-})();
-'@
 
 # --- PDF via the local Edge / Chrome (headless print) ------------------------
 function Find-HeadlessBrowser {
@@ -3410,8 +2648,8 @@ function Convert-HtmlToPdf([string]$htmlPath, [string]$pdfPath) {
         if (Test-Path -LiteralPath $pdfPath) { Remove-Item -LiteralPath $pdfPath -Force -ErrorAction Stop }
         $uri  = ([Uri]$htmlPath).AbsoluteUri
         $argLine = "--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-extensions " +
-                "--user-data-dir=""$profileDir"" --no-pdf-header-footer --print-to-pdf-no-header " +
-                "--print-to-pdf=""$pdfPath"" ""$uri"""
+                   "--user-data-dir=""$profileDir"" --no-pdf-header-footer --print-to-pdf-no-header " +
+                   "--print-to-pdf=""$pdfPath"" ""$uri"""
         Write-Log "PDF: $browser $argLine"
         $p = Start-Process -FilePath $browser -ArgumentList $argLine -PassThru -WindowStyle Hidden
         if (-not $p.WaitForExit(120000)) { try { $p.Kill() } catch {}; throw "PDF conversion timed out after 120 s." }
@@ -3422,8 +2660,233 @@ function Convert-HtmlToPdf([string]$htmlPath, [string]$pdfPath) {
         }
     }
     finally {
-        # Only the temporary browser profile this function created
         if ($profileDir -like (Join-Path $env:TEMP 'ServerWizard_pdf_*')) { Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Saved choices (per user), so a regular report is two clicks away
+$script:BuilderFile = Join-Path $script:CacheDir 'ReportBuilder.json'
+function Get-BuilderChoice {
+    try { if (Test-Path -LiteralPath $script:BuilderFile) { return (Get-Content -LiteralPath $script:BuilderFile -Raw -ErrorAction Stop | ConvertFrom-Json) } }
+    catch { Write-Log "Report Builder settings unreadable: $($_.Exception.Message)" }
+    return $null
+}
+function Save-BuilderChoice($c) {
+    try {
+        if (-not (Test-Path -LiteralPath $script:CacheDir)) { New-Item -ItemType Directory -Path $script:CacheDir -Force | Out-Null }
+        ($c | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $script:BuilderFile -Encoding UTF8 -ErrorAction Stop
+    } catch { Write-Log "Report Builder settings not saved: $($_.Exception.Message)" }
+}
+
+function New-CheckList([int]$x, [int]$y, [int]$w, [int]$h) {
+    $l = New-Object System.Windows.Forms.CheckedListBox
+    $l.CheckOnClick = $true; $l.IntegralHeight = $false
+    $l.Location = New-Object System.Drawing.Point($x, $y); $l.Size = New-Object System.Drawing.Size($w, $h)
+    return $l
+}
+
+function Show-ReportBuilder {
+    if ($script:Results.Keys.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No inventory yet - run a scan first.", "Report Builder", "OK", "Information") | Out-Null
+        return $null
+    }
+    $allKeys = @($script:Results.Keys)
+    $checked = @(Get-AllLeafNodes | Where-Object { $_.Checked } | ForEach-Object { Get-LeafName $_ } |
+                 Where-Object { $script:Results.ContainsKey($_) } | Sort-Object -Unique)
+    $counts = [ordered]@{}
+    foreach ($g in $script:GroupOrder) { $counts[$g] = 0 }
+    foreach ($k in $allKeys) { foreach ($g in @(Get-EffectiveGroups $k $script:Results[$k])) { if (-not $counts.Contains($g)) { $counts[$g] = 0 }; $counts[$g]++ } }
+    $prev = Get-BuilderChoice
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Report Builder'
+    $dlg.FormBorderStyle = 'FixedDialog'; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.StartPosition = 'CenterParent'; $dlg.ShowInTaskbar = $false
+    $dlg.ClientSize = New-Object System.Drawing.Size(900, 560)
+    $dlg.Font = $form.Font
+
+    $mkTitle = { param($t, $x) $l = New-InfoLabel $t 9.5 $true; $l.ForeColor = $script:ThAccent; $l.Location = New-Object System.Drawing.Point($x, 12); $l }
+    $t1 = & $mkTitle '1. Groups' 14
+    $t2 = & $mkTitle '2. Columns' 252
+    $t3 = & $mkTitle '3. Conditions (optional)' 590
+
+    $clbGroups = New-CheckList 14 38 224 300
+    $groupOf = @{}
+    foreach ($g in $counts.Keys) {
+        if ($counts[$g] -eq 0) { continue }
+        $text = "$g  ($($counts[$g]))"; $groupOf[$text] = $g
+        [void]$clbGroups.Items.Add($text, ($prev -and @($prev.Groups) -contains $g))
+    }
+
+    # Columns: a checkable tree, one node per category
+    $tvCols = New-Object System.Windows.Forms.TreeView
+    $tvCols.CheckBoxes = $true; $tvCols.ShowLines = $false; $tvCols.FullRowSelect = $true
+    $tvCols.Location = New-Object System.Drawing.Point(252, 38); $tvCols.Size = New-Object System.Drawing.Size(324, 448)
+    $script:BuilderTreeSync = $false
+    foreach ($cat in @($script:ReportColumns | ForEach-Object { $_.Cat } | Select-Object -Unique)) {
+        $cn = New-Object System.Windows.Forms.TreeNode ($cat)
+        $cn.NodeFont = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
+        foreach ($c in @($script:ReportColumns | Where-Object { $_.Cat -eq $cat })) {
+            $n = New-Object System.Windows.Forms.TreeNode ($c.Label); $n.Tag = $c.Id
+            $n.Checked = ($prev -and @($prev.Columns) -contains $c.Id)
+            [void]$cn.Nodes.Add($n)
+        }
+        [void]$tvCols.Nodes.Add($cn)
+    }
+    $tvCols.ExpandAll()
+    $tvCols.Add_AfterCheck({
+        param($s, $e)
+        if ($script:BuilderTreeSync -or $e.Action -eq [System.Windows.Forms.TreeViewAction]::Unknown) { return }
+        $script:BuilderTreeSync = $true
+        try { if ($e.Node.Nodes.Count) { foreach ($ch in $e.Node.Nodes) { $ch.Checked = $e.Node.Checked } } }
+        finally { $script:BuilderTreeSync = $false }
+    })
+
+    $clbFilters = New-CheckList 590 38 296 250
+    foreach ($fl in $script:ReportFilters) { [void]$clbFilters.Items.Add($fl.Label, ($prev -and @($prev.Filters) -contains $fl.Id)) }
+    $rbAll = New-Object System.Windows.Forms.RadioButton
+    $rbAll.Text = 'Server must match all ticked conditions'; $rbAll.AutoSize = $true; $rbAll.Location = New-Object System.Drawing.Point(592, 294)
+    $rbAny = New-Object System.Windows.Forms.RadioButton
+    $rbAny.Text = 'Server must match any ticked condition'; $rbAny.AutoSize = $true; $rbAny.Location = New-Object System.Drawing.Point(592, 316)
+    if ($prev -and $prev.MatchAll -eq $false) { $rbAny.Checked = $true } else { $rbAll.Checked = $true }
+    $lblHint = New-InfoLabel 'No condition ticked = every server of the ticked groups.' 8
+    $lblHint.ForeColor = $script:ThMuted; $lblHint.Location = New-Object System.Drawing.Point(592, 342)
+
+    $lblSrv = New-InfoLabel 'Servers' 9 $true; $lblSrv.ForeColor = $script:ThAccent; $lblSrv.Location = New-Object System.Drawing.Point(14, 350)
+    $rbChecked = New-Object System.Windows.Forms.RadioButton
+    $rbChecked.Text = "Checked in the list ($($checked.Count))"; $rbChecked.AutoSize = $true; $rbChecked.Location = New-Object System.Drawing.Point(16, 372)
+    $rbEvery = New-Object System.Windows.Forms.RadioButton
+    $rbEvery.Text = "All scanned ($($allKeys.Count))"; $rbEvery.AutoSize = $true; $rbEvery.Location = New-Object System.Drawing.Point(16, 394)
+    if ($checked.Count -gt 0) { $rbChecked.Checked = $true } else { $rbChecked.Enabled = $false; $rbEvery.Checked = $true }
+    $pSrv = New-Object System.Windows.Forms.Panel
+    $pSrv.Location = New-Object System.Drawing.Point(0, 368); $pSrv.Size = New-Object System.Drawing.Size(240, 50)
+    $rbChecked.Location = New-Object System.Drawing.Point(16, 2); $rbEvery.Location = New-Object System.Drawing.Point(16, 24)
+    $pSrv.Controls.AddRange(@($rbChecked, $rbEvery))
+
+    $lblLay = New-InfoLabel 'Layout' 9 $true; $lblLay.ForeColor = $script:ThAccent; $lblLay.Location = New-Object System.Drawing.Point(14, 424)
+    $pLay = New-Object System.Windows.Forms.Panel
+    $pLay.Location = New-Object System.Drawing.Point(0, 442); $pLay.Size = New-Object System.Drawing.Size(240, 50)
+    $rbPerGroup = New-Object System.Windows.Forms.RadioButton
+    $rbPerGroup.Text = 'One table per group'; $rbPerGroup.AutoSize = $true; $rbPerGroup.Location = New-Object System.Drawing.Point(16, 2)
+    $rbOne = New-Object System.Windows.Forms.RadioButton
+    $rbOne.Text = 'One table (groups as a column)'; $rbOne.AutoSize = $true; $rbOne.Location = New-Object System.Drawing.Point(16, 24)
+    if ($prev -and $prev.OneTable) { $rbOne.Checked = $true } else { $rbPerGroup.Checked = $true }
+    $pLay.Controls.AddRange(@($rbPerGroup, $rbOne))
+
+    $lblFmt = New-InfoLabel 'Format' 9 $true; $lblFmt.ForeColor = $script:ThAccent; $lblFmt.Location = New-Object System.Drawing.Point(590, 374)
+    $pFmt = New-Object System.Windows.Forms.Panel
+    $pFmt.Location = New-Object System.Drawing.Point(576, 392); $pFmt.Size = New-Object System.Drawing.Size(310, 72)
+    $rbHtml = New-Object System.Windows.Forms.RadioButton; $rbHtml.Text = 'HTML'; $rbHtml.AutoSize = $true; $rbHtml.Location = New-Object System.Drawing.Point(16, 2)
+    $rbPdf  = New-Object System.Windows.Forms.RadioButton; $rbPdf.Text = 'PDF (A4 landscape, via Edge / Chrome)'; $rbPdf.AutoSize = $true; $rbPdf.Location = New-Object System.Drawing.Point(16, 24)
+    $rbBoth = New-Object System.Windows.Forms.RadioButton; $rbBoth.Text = 'HTML + PDF'; $rbBoth.AutoSize = $true; $rbBoth.Location = New-Object System.Drawing.Point(16, 46)
+    switch ("$($prev.Format)") { 'Pdf' { $rbPdf.Checked = $true } 'Both' { $rbBoth.Checked = $true } default { $rbHtml.Checked = $true } }
+    $pFmt.Controls.AddRange(@($rbHtml, $rbPdf, $rbBoth))
+
+    $lnkTab = New-Object System.Windows.Forms.LinkLabel
+    $lnkTab.Text = 'Export the active tab as CSV instead'; $lnkTab.AutoSize = $true; $lnkTab.Location = New-Object System.Drawing.Point(14, 526)
+    $lblSum = New-InfoLabel '' 8.5; $lblSum.ForeColor = $script:ThMuted; $lblSum.Location = New-Object System.Drawing.Point(252, 500)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Cancel'; $btnCancel.Location = New-Object System.Drawing.Point(690, 518); $btnCancel.Size = New-Object System.Drawing.Size(90, 30)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'Create report'; $btnOk.Location = New-Object System.Drawing.Point(788, 518); $btnOk.Size = New-Object System.Drawing.Size(98, 30)
+    $btnOk.BackColor = $script:ThAccent; $btnOk.ForeColor = [System.Drawing.Color]::White
+    $btnOk.Font = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
+    $dlg.CancelButton = $btnCancel
+
+    $getCols = { @(foreach ($cn in $tvCols.Nodes) { foreach ($n in $cn.Nodes) { if ($n.Checked) { "$($n.Tag)" } } }) }
+    $updSum = {
+        $nG = $clbGroups.CheckedItems.Count; $nC = @(& $getCols).Count; $nF = $clbFilters.CheckedItems.Count
+        $lblSum.Text = "$nG group(s), $nC column(s), $nF condition(s) selected"
+        $btnOk.Enabled = ($nG -gt 0 -and $nC -gt 0)
+    }
+    $clbGroups.Add_ItemCheck({ $dlg.BeginInvoke([Action]{ & $updSum }) | Out-Null })
+    $clbFilters.Add_ItemCheck({ $dlg.BeginInvoke([Action]{ & $updSum }) | Out-Null })
+    $tvCols.Add_AfterCheck({ & $updSum })
+
+    $result = $null
+    $lnkTab.Add_LinkClicked({ $script:BuilderTabCsv = $true; $dlg.DialogResult = [System.Windows.Forms.DialogResult]::Retry; $dlg.Close() })
+    $btnOk.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
+
+    $dlg.Controls.AddRange(@($t1, $t2, $t3, $clbGroups, $tvCols, $clbFilters, $rbAll, $rbAny, $lblHint, $lblSrv, $pSrv,
+        $lblLay, $pLay, $lblFmt, $pFmt, $lnkTab, $lblSum, $btnCancel, $btnOk))
+    Set-DarkTheme $dlg
+    $btnOk.BackColor = $script:ThAccent; $btnOk.ForeColor = [System.Drawing.Color]::White
+    & $updSum
+
+    try {
+        $res = $dlg.ShowDialog($form)
+        if ($res -eq [System.Windows.Forms.DialogResult]::Retry) { return @{ Action = 'Tab' } }
+        if ($res -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        $choice = [ordered]@{
+            Action   = 'Report'
+            Groups   = [string[]]@(foreach ($i in $clbGroups.CheckedItems) { $groupOf["$i"] })
+            Columns  = [string[]]@(& $getCols)
+            Filters  = [string[]]@(foreach ($i in $clbFilters.CheckedIndices) { $script:ReportFilters[$i].Id })
+            MatchAll = [bool]$rbAll.Checked
+            OneTable = [bool]$rbOne.Checked
+            AllServers = [bool]$rbEvery.Checked
+            Format   = $(if ($rbPdf.Checked) { 'Pdf' } elseif ($rbBoth.Checked) { 'Both' } else { 'Html' })
+        }
+        Save-BuilderChoice $choice
+        return $choice
+    }
+    finally { $dlg.Dispose() }
+}
+
+function Invoke-ReportBuilder($c) {
+    $servers = @()
+    if (-not $c.AllServers) {
+        $servers = @(Get-AllLeafNodes | Where-Object { $_.Checked } | ForEach-Object { Get-LeafName $_ } |
+                     Where-Object { $script:Results.ContainsKey($_) } | Sort-Object -Unique)
+    }
+    $scopeText = if ($c.AllServers -or $servers.Count -eq 0) { "all scanned ($($script:Results.Keys.Count))" } else { "checked in the list ($($servers.Count))" }
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmm'
+    $tag = if (@($c.Groups).Count -le 3) { '_' + ((@($c.Groups) | ForEach-Object { $_ -replace '[^A-Za-z0-9]+', '' }) -join '+') } else { '' }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    if ($c.Format -eq 'Html') { $dlg.Filter = "HTML report (*.html)|*.html"; $ext = 'html' } else { $dlg.Filter = "PDF report (*.pdf)|*.pdf"; $ext = 'pdf' }
+    $dlg.FileName = "ServerWizard_Report${tag}_$stamp.$ext"
+    try { if ($dlg.ShowDialog($form) -ne "OK") { return }; $target = $dlg.FileName } finally { $dlg.Dispose() }
+
+    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    $tmpHtml = $null
+    try {
+        Write-Log "Report Builder: groups=$($c.Groups -join ', ') columns=$($c.Columns -join ',') filters=$($c.Filters -join ',') format=$($c.Format) -> $target"
+        Set-Status "Building report..." $script:ThAccent
+        if (@($c.Columns) | Where-Object { $_ -match 'eol|sup|main|esu|days|src' }) { Update-LifecycleIfStale }
+        $data = Get-BuilderData -Groups $c.Groups -Columns $c.Columns -Filters $c.Filters -MatchAll $c.MatchAll -OneTable $c.OneTable -Servers $servers
+        $data.MatchAll = $c.MatchAll
+        $html = ConvertTo-BuilderHtml $data $c.Groups $scopeText
+        $utf8 = New-Object Text.UTF8Encoding($true)
+        switch ($c.Format) {
+            'Html' { [IO.File]::WriteAllText($target, $html, $utf8) }
+            'Both' {
+                [IO.File]::WriteAllText([IO.Path]::ChangeExtension($target, '.html'), $html, $utf8)
+                Set-Status "Printing PDF with the local browser..." $script:ThAccent
+                Convert-HtmlToPdf ([IO.Path]::ChangeExtension($target, '.html')) $target
+            }
+            'Pdf' {
+                $tmpHtml = Join-Path $env:TEMP ("ServerWizard_report_" + [guid]::NewGuid().ToString('N') + '.html')
+                [IO.File]::WriteAllText($tmpHtml, $html, $utf8)
+                Set-Status "Printing PDF with the local browser..." $script:ThAccent
+                Convert-HtmlToPdf $tmpHtml $target
+            }
+        }
+        $n = 0; foreach ($k in $data.Sections.Keys) { $n += @($data.Sections[$k]).Count }
+        Set-Status "Report saved ($n row(s)): $target" $script:OkGreen
+        try { Start-Process -FilePath $target } catch { Write-Log "Could not open report: $($_.Exception.Message)" }
+    }
+    catch {
+        Write-Log "REPORT FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        $msg = "Report failed: $($_.Exception.Message)"
+        if ($c.Format -ne 'Html') { $msg += "`n`nTip: choose HTML and print to PDF from the browser." }
+        [System.Windows.Forms.MessageBox]::Show("$msg`n`nSee log: $script:LogFile", "Report Builder", "OK", "Error") | Out-Null
+        Set-Status "Report failed (see log)." $script:ThBad
+    }
+    finally {
+        if ($tmpHtml -and (Test-Path -LiteralPath $tmpHtml)) { Remove-Item -LiteralPath $tmpHtml -Force -ErrorAction SilentlyContinue }
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
 }
 
@@ -3507,7 +2970,7 @@ $btnLoadAD.Add_Click({
         [System.Windows.Forms.MessageBox]::Show(
             "AD query failed: $_`n`nDetails were written to the log:`n$script:LogFile",
             "Error", "OK", "Error") | Out-Null
-        Set-Status "AD query failed (see log)." ([System.Drawing.Color]::Red)
+        Set-Status "AD query failed (see log)." $script:ThBad
     }
 })
 
@@ -3581,18 +3044,19 @@ $tabs.Add_DrawItem({
     $rect = $e.Bounds
     $isSel = ($e.Index -eq $tabs.SelectedIndex)
 
-    $back = if ($isSel) { $script:MerlinBlueLt } else { [System.Drawing.Color]::White }
+    $back = if ($isSel) { $script:ThSurface } else { $script:ThPanel }
     $backBrush = New-Object System.Drawing.SolidBrush ($back)
     $g.FillRectangle($backBrush, $rect)
     $backBrush.Dispose()
 
-    $textBrush = New-Object System.Drawing.SolidBrush ($(if ($isSel) { $script:MerlinBlue } else { [System.Drawing.Color]::Black }))
+    $textBrush = New-Object System.Drawing.SolidBrush ($(if ($isSel) { $script:MerlinBlue } else { $script:ThText }))
     $font = New-Object System.Drawing.Font($script:FontName, 9, $(if ($isSel) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
     $g.DrawString($tabs.TabPages[$e.Index].Text, $font, $textBrush,
         ([single]($rect.X + 4)), ([single]($rect.Y + 4)))
     $textBrush.Dispose(); $font.Dispose()
 
-    # x button
+    # x button (Overview stays)
+    if ($tabs.TabPages[$e.Index].Text -eq 'Overview') { return }
     $xBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 60, 60))
     $xFont  = New-Object System.Drawing.Font($script:FontName, 8, [System.Drawing.FontStyle]::Bold)
     $g.DrawString("x", $xFont, $xBrush, ([single]($rect.Right - 16)), ([single]($rect.Y + 4)))
@@ -3604,7 +3068,7 @@ $tabs.Add_MouseDown({
     for ($i = 0; $i -lt $tabs.TabPages.Count; $i++) {
         $r = $tabs.GetTabRect($i)
         $xRect = New-Object System.Drawing.Rectangle (($r.Right - 18), ($r.Top + 2), 16, 16)
-        if ($xRect.Contains($e.Location)) {
+        if ($xRect.Contains($e.Location) -and $tabs.TabPages[$i].Text -ne 'Overview') {
             $tabs.TabPages.RemoveAt($i)
             break
         }
@@ -3667,7 +3131,7 @@ $timer.Add_Tick({
 
     if ($script:ScanJob.State -in 'Completed', 'Failed', 'Stopped') { Finish-Scan }
     }
-    catch { Set-Status "Scan monitor error: $_" ([System.Drawing.Color]::Red) }
+    catch { Set-Status "Scan monitor error: $_" $script:ThBad }
 })
 
 $btnSearch.Add_Click({ Invoke-Search })
@@ -3752,143 +3216,17 @@ function Export-ActiveTabCsv {
 # Export Report: one dialog to choose WHAT goes into the report (roles,
 # servers) and HOW (interactive HTML, CSV per role, active tab CSV), or to
 # open the in-app Reports view.
-function Show-ExportDialog {
-    if ($script:Results.Keys.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No inventory yet - run a scan first.", "Export Report", "OK", "Information") | Out-Null
-        return $null
-    }
-    $allKeys  = @($script:Results.Keys)
-    $checked  = @(Get-AllLeafNodes | Where-Object { $_.Checked } | ForEach-Object { Get-LeafName $_ } |
-                  Where-Object { $script:Results.ContainsKey($_) } | Sort-Object -Unique)
-    $counts = [ordered]@{}
-    foreach ($g in $script:GroupOrder) { $counts[$g] = 0 }
-    foreach ($k in $allKeys) { foreach ($g in @(Get-EffectiveGroups $k $script:Results[$k])) { if (-not $counts.Contains($g)) { $counts[$g] = 0 }; $counts[$g]++ } }
-    $activeTab = $tabs.SelectedTab
-    $tabOk = ($activeTab -and $activeTab.Text -notin 'Scan Progress', 'Reports')
-
-    $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = 'Export Report'
-    $dlg.FormBorderStyle = 'FixedDialog'
-    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
-    $dlg.StartPosition = 'CenterParent'
-    $dlg.ClientSize = New-Object System.Drawing.Size(470, 540)
-    $dlg.Font = $form.Font
-    $dlg.BackColor = [System.Drawing.Color]::White
-    $dlg.ShowInTaskbar = $false
-
-    $lblRoles = New-Object System.Windows.Forms.Label
-    $lblRoles.Text = 'Roles to include'; $lblRoles.ForeColor = $script:MerlinBlue
-    $lblRoles.Font = New-Object System.Drawing.Font($script:FontName, 10, [System.Drawing.FontStyle]::Bold)
-    $lblRoles.Location = New-Object System.Drawing.Point(14, 12); $lblRoles.AutoSize = $true
-
-    $lnkAll = New-Object System.Windows.Forms.LinkLabel
-    $lnkAll.Text = 'All'; $lnkAll.AutoSize = $true; $lnkAll.Location = New-Object System.Drawing.Point(370, 15)
-    $lnkNone = New-Object System.Windows.Forms.LinkLabel
-    $lnkNone.Text = 'None'; $lnkNone.AutoSize = $true; $lnkNone.Location = New-Object System.Drawing.Point(410, 15)
-
-    $clb = New-Object System.Windows.Forms.CheckedListBox
-    $clb.CheckOnClick = $true
-    $clb.Location = New-Object System.Drawing.Point(14, 38); $clb.Size = New-Object System.Drawing.Size(442, 214)
-    $roleOf = @{}
-    foreach ($g in $counts.Keys) {
-        if ($counts[$g] -eq 0) { continue }
-        $text = "$g  ($($counts[$g]))"
-        $roleOf[$text] = $g
-        [void]$clb.Items.Add($text, $true)
-    }
-    $lnkAll.Add_LinkClicked({ for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $true) } })
-    $lnkNone.Add_LinkClicked({ for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $false) } })
-
-    $grpSrv = New-Object System.Windows.Forms.GroupBox
-    $grpSrv.Text = 'Servers'; $grpSrv.ForeColor = $script:MerlinBlue
-    $grpSrv.Location = New-Object System.Drawing.Point(14, 262); $grpSrv.Size = New-Object System.Drawing.Size(442, 76)
-    $rbChecked = New-Object System.Windows.Forms.RadioButton
-    $rbChecked.Text = "Servers checked in the list ($($checked.Count))"; $rbChecked.ForeColor = [System.Drawing.Color]::Black
-    $rbChecked.Location = New-Object System.Drawing.Point(12, 22); $rbChecked.AutoSize = $true
-    $rbAll = New-Object System.Windows.Forms.RadioButton
-    $rbAll.Text = "All scanned servers ($($allKeys.Count))"; $rbAll.ForeColor = [System.Drawing.Color]::Black
-    $rbAll.Location = New-Object System.Drawing.Point(12, 46); $rbAll.AutoSize = $true
-    if ($checked.Count -gt 0) { $rbChecked.Checked = $true } else { $rbChecked.Enabled = $false; $rbAll.Checked = $true }
-    $grpSrv.Controls.AddRange(@($rbChecked, $rbAll))
-
-    $grpFmt = New-Object System.Windows.Forms.GroupBox
-    $grpFmt.Text = 'Format'; $grpFmt.ForeColor = $script:MerlinBlue
-    $grpFmt.Location = New-Object System.Drawing.Point(14, 346); $grpFmt.Size = New-Object System.Drawing.Size(442, 124)
-    $rbHtml = New-Object System.Windows.Forms.RadioButton
-    $rbHtml.Text = 'HTML (opens in the browser; filters, search, Print / PDF button)'; $rbHtml.ForeColor = [System.Drawing.Color]::Black
-    $rbHtml.Location = New-Object System.Drawing.Point(12, 22); $rbHtml.AutoSize = $true; $rbHtml.Checked = $true
-    $rbPdf = New-Object System.Windows.Forms.RadioButton
-    $rbPdf.Text = 'PDF (A4 landscape, printed with Edge / Chrome)'; $rbPdf.ForeColor = [System.Drawing.Color]::Black
-    $rbPdf.Location = New-Object System.Drawing.Point(12, 46); $rbPdf.AutoSize = $true
-    $rbBoth = New-Object System.Windows.Forms.RadioButton
-    $rbBoth.Text = 'HTML + PDF (same name, side by side)'; $rbBoth.ForeColor = [System.Drawing.Color]::Black
-    $rbBoth.Location = New-Object System.Drawing.Point(12, 70); $rbBoth.AutoSize = $true
-    $rbTab = New-Object System.Windows.Forms.RadioButton
-    $rbTab.Text = if ($tabOk) { "Active tab only (CSV): $($activeTab.Text)" } else { 'Active tab only (CSV) - open a server or search tab first' }
-    $rbTab.ForeColor = [System.Drawing.Color]::Black
-    $rbTab.Location = New-Object System.Drawing.Point(12, 94); $rbTab.AutoSize = $true; $rbTab.Enabled = $tabOk
-    $grpFmt.Controls.AddRange(@($rbHtml, $rbPdf, $rbBoth, $rbTab))
-
-    $toggle = { $clb.Enabled = -not $rbTab.Checked; $grpSrv.Enabled = -not $rbTab.Checked }
-    $rbTab.Add_CheckedChanged($toggle)
-
-    $btnView = New-Object System.Windows.Forms.Button
-    $btnView.Text = 'Open in-app view'; $btnView.FlatStyle = 'Flat'; $btnView.ForeColor = $script:MerlinBlue
-    $btnView.Location = New-Object System.Drawing.Point(14, 492); $btnView.Size = New-Object System.Drawing.Size(140, 32)
-    $btnView.DialogResult = [System.Windows.Forms.DialogResult]::Retry
-    $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = 'Cancel'; $btnCancel.FlatStyle = 'Flat'
-    $btnCancel.Location = New-Object System.Drawing.Point(254, 492); $btnCancel.Size = New-Object System.Drawing.Size(90, 32)
-    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $btnOk = New-Object System.Windows.Forms.Button
-    $btnOk.Text = 'Export'; $btnOk.FlatStyle = 'Flat'
-    $btnOk.BackColor = $script:MerlinYellow; $btnOk.ForeColor = $script:MerlinBlue
-    $btnOk.Font = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
-    $btnOk.Location = New-Object System.Drawing.Point(354, 492); $btnOk.Size = New-Object System.Drawing.Size(102, 32)
-    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $dlg.AcceptButton = $btnOk; $dlg.CancelButton = $btnCancel
-
-    $dlg.Controls.AddRange(@($lblRoles, $lnkAll, $lnkNone, $clb, $grpSrv, $grpFmt, $btnView, $btnCancel, $btnOk))
-
-    try {
-        $res = $dlg.ShowDialog($form)
-        if ($res -eq [System.Windows.Forms.DialogResult]::Retry) { return @{ Action = 'View' } }
-        if ($res -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
-        if ($rbTab.Checked) { return @{ Action = 'Tab' } }
-        $roles = @(foreach ($item in $clb.CheckedItems) { $roleOf["$item"] })
-        if ($roles.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show("Select at least one role.", "Export Report", "OK", "Information") | Out-Null
-            return $null
-        }
-        # Every role ticked = no role filter (also keeps servers with no group)
-        if ($roles.Count -eq $clb.Items.Count) { $roles = @() }
-        return @{
-            Action     = 'Report'
-            Format     = if ($rbPdf.Checked) { 'Pdf' } elseif ($rbBoth.Checked) { 'Both' } else { 'Html' }
-            Roles      = [string[]]$roles
-            AllServers = [bool]$rbAll.Checked
-        }
-    }
-    finally { $dlg.Dispose() }
-}
-
 $btnExport.Add_Click({
     try {
-        Write-Log "Export Report clicked"
-        $choice = Show-ExportDialog
+        Write-Log "Report Builder opened"
+        $choice = Show-ReportBuilder
         if (-not $choice) { return }
-        switch ($choice.Action) {
-            'View'   { Open-ReportsTab }
-            'Tab'    { Export-ActiveTabCsv }
-            'Report' {
-                Write-Log "Export: $($choice.Format), roles: $(if ($choice.Roles.Count) { $choice.Roles -join ', ' } else { 'all' }), all servers: $($choice.AllServers)"
-                Invoke-RoleReport -Format $choice.Format -Roles $choice.Roles -AllServers:$choice.AllServers
-            }
-        }
+        if ($choice.Action -eq 'Tab') { Export-ActiveTabCsv; return }
+        Invoke-ReportBuilder $choice
     }
     catch {
-        Write-Log "EXPORT FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
-        Set-Status "Export Report failed: $($_.Exception.Message) (see log)" ([System.Drawing.Color]::Red)
+        Write-Log "REPORT BUILDER FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        Set-Status "Report Builder failed: $($_.Exception.Message) (see log)" $script:ThBad
     }
 })
 
@@ -3906,6 +3244,7 @@ if (Load-Cache) {
     foreach ($k in $script:Results.Keys) { Update-DerivedFields $script:Results[$k] }
     Build-SearchIndex
     Group-AndRebuild
+    Show-Overview
     $btnExport.Enabled = $true
     $cacheDate = (Get-Item $script:CacheFile).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
     Set-Status "Loaded $($script:Results.Keys.Count) servers from cache ($cacheDate). Click a server to open it in a tab." $script:OkGreen
@@ -3923,6 +3262,7 @@ $form.Add_Shown({
     try {
         Update-AllLifecycle
         Build-SearchIndex
+        Update-Overview
         foreach ($tp in $tabs.TabPages) {
             $res = $script:Results["$($tp.Text)".ToUpper()]
             if ($res -and $tp.Controls.Count -gt 0) { Render-Detail $res $tp.Controls[0] }
