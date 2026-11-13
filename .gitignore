@@ -15,3 +15,7 @@ ServerWizard_*.csv
 # OS noise
 Thumbs.db
 desktop.ini
+
+# v1.5 lifecycle source cache + role reports
+OfficialSources.xml
+ServerWizard_RoleReport_*.html
