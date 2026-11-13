@@ -13,8 +13,14 @@ Scan every Windows Server in your Active Directory domain over WinRM and browse 
 - **Collected data**: OS + version, install/last restart dates, IPs, CPU/RAM, disks with free-space warnings, roles & features, automatic services, last RDP logons, IIS sites + DNS names + modules + SSL bindings (with certificate dates), listening ports, SQL instance details (edition/version), database services, Microsoft and 3rd-party software with versions, running 3rd-party services
 - **Role-based reporting** (`Export Report` opens one dialog):
   - choose the **roles** (e.g. only IIS, only SQL, or IIS + SQL) and the **servers** (checked in the list or all scanned) that go into the report
-  - **Interactive HTML report** (single offline file, no external resources): role chips (click = only that role, Ctrl/Shift+click = combine), "Problems only" filter (EOL / extended support / expired or expiring certificates), free-text search with highlighting, sortable columns, per-section "Download view (CSV)", KPIs that follow the filter, and a bookmarkable view in the address bar (`report.html#roles=IIS%20%2F%20Web&problems=1`)
-  - **CSV per role / section** (semicolon-delimited, UTF-8 BOM, formula-injection safe) into a folder
+  - **Readable report: HTML, PDF or both** (v1.6), in Turkish or English. It only shows facts (no advice, no scores) and is written for the team, management and auditors alike:
+    1. Summary: servers, role groups, OS / database versions, support status and certificate expiry as simple bar charts
+    2. Lifecycle calendar for the next 12 months (support end, EOL, ESU end, certificate expiry), dates only
+    3. Operating systems, databases and IIS with install date, version, support end, EOL, time left, status and the official source of each date
+    4. Role views, certificates (with "In use" = IIS binding), one card per server
+    5. Appendix: method notes, every official source with its retrieval time (offline copies marked) and the classification evidence
+  - The HTML file works offline: role chips, a neutral "only dates passed or within 90 days" filter, search, sortable columns and a Print / PDF button. The PDF (A4 landscape) is printed by the local Microsoft Edge or Google Chrome in headless mode; nothing leaves the machine
+  - Scope chosen in the dialog: roles to include and servers (checked or all scanned); the scope and the user who generated it are printed on the report
   - **Active tab only (CSV)**: the v1.4 per-server / search-result export
   - **Open in-app view**: a `Reports` tab with a section selector, a sortable, colour-coded grid (double-click a row to open the server) and export / refresh buttons
 - **Role classification evidence**: every placement shows why (Windows role, database engine with its instance, or service), in the server tab and in the report's *Role Classification* section. Database packages without a service (client tools, drivers) are listed but do not make a server a database server
@@ -42,6 +48,7 @@ Scan every Windows Server in your Active Directory domain over WinRM and browse 
 - WinRM enabled on target servers (`Enable-PSRemoting -Force`)
 - Local admin rights on targets recommended (event log / IIS / registry details)
 - HTTPS access from the machine running the app to the official lifecycle hosts above (optional; without it support / EOL dates show as not resolved)
+- PDF export needs Microsoft Edge or Google Chrome on the machine running Server Wizard (HTML export does not)
 - Results cached by v1.4 still open; rescan once with v1.5 to collect role, database, certificate and lifecycle details
 
 ## Getting started

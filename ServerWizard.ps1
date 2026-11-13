@@ -32,7 +32,7 @@ function Set-DoubleBuffered($ctrl) {
 }
 
 # --- Version ---------------------------------------------------------------
-$script:AppVersion = '1.5.1'
+$script:AppVersion = '1.6'
 
 # --- UI font: Open Sans if installed on this server, else Segoe UI ---------
 $script:FontName = 'Segoe UI'
@@ -2455,17 +2455,30 @@ function ConvertTo-SafeCsvRow($row) {
     return [PSCustomObject]$o
 }
 
+# Default report language (remembered for the session; set by the Export dialog)
+$script:ReportLangDefault = 'tr'
+
+function Get-ReportScopeText([string[]]$Roles, [int]$serverCount, [bool]$AllServers) {
+    $r = if (@($Roles).Count -gt 0) { (@($Roles) -join ', ') } else { (T 'scope_all_roles') }
+    $s = if ($AllServers) { "all scanned servers" } else { "selected servers" }
+    if ($script:RptLang -eq 'tr') { $s = if ($AllServers) { 'taranan t&#252;m sunucular' } else { 'se&#231;ili sunucular' } }
+    # Plain text: the renderer HTML-encodes it
+    return [Net.WebUtility]::HtmlDecode("$r | $s")
+}
+
+# Builds the readable report (HTML and / or PDF) for the chosen roles / servers.
 function Invoke-RoleReport {
     param(
-        [ValidateSet('Html', 'Csv')][string]$Format = 'Html',
+        [ValidateSet('Html', 'Pdf', 'Both')][string]$Format = 'Html',
         [string[]]$Roles = @(),
-        [switch]$AllServers
+        [switch]$AllServers,
+        [ValidateSet('tr', 'en')][string]$Language = 'tr'
     )
     if ($script:Results.Keys.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Run a scan first.", "Export Report", "OK", "Information") | Out-Null
         return
     }
-    $keys = Get-ReportServerKeys -Roles $Roles -AllServers:$AllServers
+    $keys = @(Get-ReportServerKeys -Roles $Roles -AllServers:$AllServers)
     if ($keys.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("No scanned server matches the selected roles.", "Export Report", "OK", "Information") | Out-Null
         return
@@ -2473,58 +2486,62 @@ function Invoke-RoleReport {
     $stamp = Get-Date -Format 'yyyyMMdd_HHmm'
     $tag   = ''
     if (@($Roles).Count -gt 0 -and @($Roles).Count -le 3) { $tag = '_' + ((@($Roles) | ForEach-Object { $_ -replace '[^A-Za-z0-9]+', '' }) -join '+') }
-    $target = $null
-    if ($Format -eq 'Html') {
-        $dlg          = New-Object System.Windows.Forms.SaveFileDialog
-        $dlg.Filter   = "HTML report (*.html)|*.html"
-        $dlg.FileName = "ServerWizard_RoleReport${tag}_$stamp.html"
-        if ($dlg.ShowDialog($form) -ne "OK") { return }
-        $target = $dlg.FileName
-    }
-    else {
-        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dlg.Description = "Folder for the role-based CSV files (one file per role / section)"
-        if ($dlg.ShowDialog($form) -ne "OK") { return }
-        $target = $dlg.SelectedPath
-    }
+
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    if ($Format -eq 'Html') { $dlg.Filter = "HTML report (*.html)|*.html"; $ext = 'html' }
+    else { $dlg.Filter = "PDF report (*.pdf)|*.pdf"; $ext = 'pdf' }
+    $dlg.FileName = "ServerWizard_Report${tag}_$stamp.$ext"
+    $dlg.Title = if ($Format -eq 'Both') { 'Save report (the HTML copy is saved next to the PDF)' } else { 'Save report' }
+    try { if ($dlg.ShowDialog($form) -ne "OK") { return }; $target = $dlg.FileName } finally { $dlg.Dispose() }
 
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    $tmpHtml = $null
     try {
-        Write-Log "Role report ($Format) started for $($keys.Count) servers -> $target"
+        Write-Log "Report ($Format, $Language) started for $($keys.Count) servers -> $target"
+        Set-Status "Building report for $($keys.Count) server(s)..."
         # Lifecycle dates are re-checked against the official sources
         # (skipped only if that already happened in the last 15 minutes)
         Update-LifecycleIfStale
-        Build-SearchIndex
-        $sections = Get-ReportSections $keys $Roles
+        $script:RptLang = $Language
+        $model = Get-ReportModel $keys $Roles
+        $html  = ConvertTo-ReadableReport $model $Language (Get-ReportScopeText $Roles $keys.Count ([bool]$AllServers))
+        $utf8  = New-Object Text.UTF8Encoding($true)
 
-        if ($Format -eq 'Html') {
-            $html = ConvertTo-HtmlReport $sections $keys
-            [IO.File]::WriteAllText($target, $html, (New-Object Text.UTF8Encoding($true)))
-            Set-Status "Role report saved ($($keys.Count) servers): $target" $script:OkGreen
-            try { Start-Process -FilePath $target } catch {}
-        }
-        else {
-            $n = 0
-            foreach ($name in $sections.Keys) {
-                $rows = @($sections[$name].Rows)
-                if ($rows.Count -eq 0) { continue }
-                $safe = ($name -replace '[\\/:*?"<>|&]', '' -replace '\s+', '_').Trim('_')
-                $file = Join-Path $target "ServerWizard_${stamp}${tag}_$safe.csv"
-                $rows | ForEach-Object { ConvertTo-SafeCsvRow $_ } |
-                    Export-Csv -Path $file -NoTypeInformation -Encoding UTF8 -Delimiter ';'
-                $n++
+        switch ($Format) {
+            'Html' {
+                [IO.File]::WriteAllText($target, $html, $utf8)
+                $open = $target
             }
-            Set-Status "$n role CSV file(s) saved ($($keys.Count) servers) in $target" $script:OkGreen
+            'Both' {
+                $htmlPath = [IO.Path]::ChangeExtension($target, '.html')
+                [IO.File]::WriteAllText($htmlPath, $html, $utf8)
+                Set-Status "Printing PDF with the local browser..."
+                Convert-HtmlToPdf $htmlPath $target
+                $open = $target
+            }
+            'Pdf' {
+                $tmpHtml = Join-Path $env:TEMP ("ServerWizard_report_" + [guid]::NewGuid().ToString('N') + '.html')
+                [IO.File]::WriteAllText($tmpHtml, $html, $utf8)
+                Set-Status "Printing PDF with the local browser..."
+                Convert-HtmlToPdf $tmpHtml $target
+                $open = $target
+            }
         }
-        Write-Log "Role report ($Format) finished: $target"
+        Set-Status "Report saved ($($keys.Count) servers): $target" $script:OkGreen
+        Write-Log "Report ($Format) finished: $target"
+        try { Start-Process -FilePath $open } catch { Write-Log "Could not open report: $($_.Exception.Message)" }
     }
     catch {
-        Write-Log "ROLE REPORT FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
-        [System.Windows.Forms.MessageBox]::Show("Report failed: $($_.Exception.Message)`n`nSee log: $script:LogFile",
-            "Export Report", "OK", "Error") | Out-Null
+        Write-Log "REPORT FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        $msg = "Report failed: $($_.Exception.Message)"
+        if ($Format -ne 'Html') { $msg += "`n`nTip: choose the HTML format and use 'Print / PDF' in the browser." }
+        [System.Windows.Forms.MessageBox]::Show("$msg`n`nSee log: $script:LogFile", "Export Report", "OK", "Error") | Out-Null
         Set-Status "Report failed (see log)." ([System.Drawing.Color]::Red)
     }
-    finally { $form.Cursor = [System.Windows.Forms.Cursors]::Default }
+    finally {
+        if ($tmpHtml -and (Test-Path -LiteralPath $tmpHtml)) { Remove-Item -LiteralPath $tmpHtml -Force -ErrorAction SilentlyContinue }
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
 }
 
 # ============================================================================
@@ -2628,7 +2645,7 @@ function Open-ReportsTab {
         }
         $btnRefresh = & $mk 'Refresh (official sources)' 374 180 $true
         $btnHtml    = & $mk 'Export HTML...' 562 120 $false
-        $btnCsv     = & $mk 'Export CSV per role...' 690 160 $false
+        $btnCsv     = & $mk 'Export PDF...' 690 120 $false
 
         $info = New-Object System.Windows.Forms.Label
         $info.AutoSize = $false; $info.Location = New-Object System.Drawing.Point(10, 40)
@@ -2678,8 +2695,8 @@ function Open-ReportsTab {
 
         $cmb.Add_SelectedIndexChanged({ try { Show-ReportSection } catch { Write-Log "Report section failed: $($_.Exception.Message)" } })
         $btnRefresh.Add_Click({ Update-ReportsTab $true })
-        $btnHtml.Add_Click({ Invoke-RoleReport -Format Html })
-        $btnCsv.Add_Click({ Invoke-RoleReport -Format Csv })
+        $btnHtml.Add_Click({ Invoke-RoleReport -Format Html -Language $script:ReportLangDefault })
+        $btnCsv.Add_Click({ Invoke-RoleReport -Format Pdf -Language $script:ReportLangDefault })
 
         $tp.Controls.Add($grid)
         $tp.Controls.Add($bar)      # added last = docked first (top)
@@ -2693,6 +2710,825 @@ function Open-ReportsTab {
         Write-Log "OPEN REPORTS FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
         [System.Windows.Forms.MessageBox]::Show("Reports could not be opened: $($_.Exception.Message)`n`nSee log: $script:LogFile",
             "Reports", "OK", "Error") | Out-Null
+    }
+}
+
+$script:ReportText = @{
+    en = @{
+        title = 'Server Inventory Report'
+        generated = 'Generated {0} by {1} on {2}'
+        scope = 'Scope'
+        scope_all_roles = 'All roles'
+        servers_n = '{0} server(s)'
+        toc = 'Contents'
+        s_summary = 'Summary'
+        summary_note = 'Figures cover all servers in the report scope.'
+        k_servers = 'Servers'
+        k_roles = 'Role groups'
+        k_os = 'OS versions'
+        k_db = 'Database engines'
+        k_certs = 'Certificates'
+        d_roles = 'Servers per role'
+        d_os = 'Operating system versions'
+        d_db = 'Database products and versions'
+        d_status = 'Support status (operating systems, databases, IIS)'
+        d_certs = 'Certificates by expiry'
+        s_calendar = 'Lifecycle calendar: next 12 months'
+        cal_note = 'Vendor-published support dates and certificate expiry dates, by month.'
+        cal_none = 'No dates.'
+        ev_support = 'Mainstream support ends'
+        ev_eol = 'End of support (EOL)'
+        ev_esu = 'Paid extended security updates (ESU) end'
+        ev_cert = 'Certificate expires'
+        s_os = 'Operating systems'
+        s_db = 'Databases'
+        s_iis = 'IIS / Web'
+        s_roles = 'Role views'
+        s_certs = 'Certificates'
+        s_cards = 'Server details'
+        s_appendix = 'Sources and method'
+        s_evidence = 'Role classification'
+        c_server = 'Server'
+        c_roles = 'Roles'
+        c_os = 'Operating system'
+        c_build = 'Build'
+        c_installed = 'Installed'
+        c_restart = 'Last restart'
+        c_product = 'Product'
+        c_version = 'Version'
+        c_edition = 'Edition / instance'
+        c_mainstream = 'Mainstream support end'
+        c_support = 'Support end'
+        c_eol = 'End of support (EOL)'
+        c_esu = 'ESU end'
+        c_days = 'Time left'
+        c_status = 'Status'
+        c_source = 'Source'
+        c_state = 'Service'
+        c_sites = 'Sites'
+        c_expires = 'Expires'
+        c_issuer = 'Issuer'
+        c_inuse = 'In use'
+        c_name = 'Name'
+        c_count = 'Count'
+        c_date = 'Date'
+        c_event = 'Event'
+        c_group = 'Role group'
+        c_evidence = 'Evidence'
+        c_retrieved = 'Retrieved'
+        c_url = 'Official source'
+        c_ip = 'IP addresses'
+        c_ports = 'Listening ports'
+        c_rolesvc = 'Roles and role services'
+        c_features = 'Features'
+        c_policy = 'Lifecycle policy'
+        c_role_services = 'Role services'
+        yes = 'Yes'
+        no = 'No'
+        not_bound = 'Not bound in IIS'
+        st_supported = 'Supported'
+        st_extended = 'Extended support (security updates only)'
+        st_eol = 'End of support passed'
+        st_esu = 'End of support passed (paid ESU available)'
+        st_noeol = 'Supported (no end date announced)'
+        st_unknown = 'No official date found'
+        cs_expired = 'Expired'
+        cs_30 = 'Expires within 30 days'
+        cs_90 = 'Expires in 31-90 days'
+        cs_365 = 'Expires in 91-365 days'
+        cs_later = 'Valid for more than a year'
+        f_roles = 'Roles'
+        f_all = 'All'
+        f_dates = 'Only dates passed or within 90 days'
+        f_search = 'Search server, product, version, certificate...'
+        f_reset = 'Reset'
+        f_print = 'Print / PDF'
+        f_hint = 'Filters apply to the detail tables and server cards; the summary always covers the full report scope.'
+        m_dates = 'Support and end-of-support dates are read only from the vendors'' official pages when the report is created; every date is listed with its source and retrieval time below.'
+        m_approx = 'Install dates marked (approx.) are folder or binary creation times.'
+        m_certs = 'Certificates come from the LocalMachine\My and WebHosting stores; ''In use'' means the certificate is bound to an IIS site.'
+        m_readonly = 'Read-only inventory: no changes were made to any server.'
+        m_noeol = '''No end date announced'' means the vendor''s official page lists the version as supported without an end date.'
+        offline = 'offline copy of the official page'
+        approx = '(approx.)'
+        none = 'None detected'
+        in_days = 'in {0} days'
+        days_ago = '{0} days ago'
+        today = 'today'
+        rescan = 'Rescan with v1.5 or later for details'
+        more = 'and {0} more'
+        page_note = 'Server Wizard v{0}'
+    }
+    tr = @{
+        title = 'Sunucu Envanter Raporu'
+        generated = '{0} tarihinde {1} taraf&#305;ndan {2} &#252;zerinde olu&#351;turuldu'
+        scope = 'Kapsam'
+        scope_all_roles = 'T&#252;m roller'
+        servers_n = '{0} sunucu'
+        toc = '&#304;&#231;indekiler'
+        s_summary = '&#214;zet'
+        summary_note = 'Rakamlar rapor kapsam&#305;ndaki t&#252;m sunucular&#305; kapsar.'
+        k_servers = 'Sunucu'
+        k_roles = 'Rol grubu'
+        k_os = '&#304;&#351;letim sistemi s&#252;r&#252;m&#252;'
+        k_db = 'Veritaban&#305; motoru'
+        k_certs = 'Sertifika'
+        d_roles = 'Role g&#246;re sunucu say&#305;s&#305;'
+        d_os = '&#304;&#351;letim sistemi s&#252;r&#252;mleri'
+        d_db = 'Veritaban&#305; &#252;r&#252;n ve s&#252;r&#252;mleri'
+        d_status = 'Destek durumu (i&#351;letim sistemi, veritaban&#305;, IIS)'
+        d_certs = 'Biti&#351; tarihine g&#246;re sertifikalar'
+        s_calendar = 'Ya&#351;am d&#246;ng&#252;s&#252; takvimi: &#246;n&#252;m&#252;zdeki 12 ay'
+        cal_note = '&#220;reticilerin yay&#305;mlad&#305;&#287;&#305; destek tarihleri ve sertifika biti&#351; tarihleri, aylara g&#246;re.'
+        cal_none = 'Tarih yok.'
+        ev_support = 'Ana ak&#305;m destek sona eriyor'
+        ev_eol = 'Destek sona eriyor (EOL)'
+        ev_esu = '&#220;cretli geni&#351;letilmi&#351; g&#252;venlik g&#252;ncellemeleri (ESU) sona eriyor'
+        ev_cert = 'Sertifika s&#252;resi doluyor'
+        s_os = '&#304;&#351;letim sistemleri'
+        s_db = 'Veritabanlar&#305;'
+        s_iis = 'IIS / Web'
+        s_roles = 'Rol g&#246;r&#252;n&#252;mleri'
+        s_certs = 'Sertifikalar'
+        s_cards = 'Sunucu detaylar&#305;'
+        s_appendix = 'Kaynaklar ve y&#246;ntem'
+        s_evidence = 'Rol s&#305;n&#305;fland&#305;rmas&#305;'
+        c_server = 'Sunucu'
+        c_roles = 'Roller'
+        c_os = '&#304;&#351;letim sistemi'
+        c_build = 'Derleme'
+        c_installed = 'Kurulum'
+        c_restart = 'Son yeniden ba&#351;latma'
+        c_product = '&#220;r&#252;n'
+        c_version = 'S&#252;r&#252;m'
+        c_edition = 'S&#252;r&#252;m t&#252;r&#252; / instance'
+        c_mainstream = 'Ana ak&#305;m destek sonu'
+        c_support = 'Destek sonu'
+        c_eol = 'Destek sonu (EOL)'
+        c_esu = 'ESU sonu'
+        c_days = 'Kalan s&#252;re'
+        c_status = 'Durum'
+        c_source = 'Kaynak'
+        c_state = 'Servis'
+        c_sites = 'Siteler'
+        c_expires = 'Biti&#351;'
+        c_issuer = 'Yay&#305;mlayan'
+        c_inuse = 'Kullan&#305;mda'
+        c_name = 'Ad'
+        c_count = 'Adet'
+        c_date = 'Tarih'
+        c_event = 'Olay'
+        c_group = 'Rol grubu'
+        c_evidence = 'Gerek&#231;e'
+        c_retrieved = 'Al&#305;nma zaman&#305;'
+        c_url = 'Resmi kaynak'
+        c_ip = 'IP adresleri'
+        c_ports = 'Dinlenen portlar'
+        c_rolesvc = 'Roller ve rol servisleri'
+        c_features = '&#214;zellikler'
+        c_policy = 'Ya&#351;am d&#246;ng&#252;s&#252; politikas&#305;'
+        c_role_services = 'Rol servisleri'
+        yes = 'Evet'
+        no = 'Hay&#305;r'
+        not_bound = 'IIS''te ba&#287;l&#305; de&#287;il'
+        st_supported = 'Destekleniyor'
+        st_extended = 'Geni&#351;letilmi&#351; destek (yaln&#305;zca g&#252;venlik g&#252;ncellemeleri)'
+        st_eol = 'Destek sona erdi'
+        st_esu = 'Destek sona erdi (&#252;cretli ESU mevcut)'
+        st_noeol = 'Destekleniyor (biti&#351; tarihi ilan edilmedi)'
+        st_unknown = 'Resmi tarih bulunamad&#305;'
+        cs_expired = 'S&#252;resi doldu'
+        cs_30 = '30 g&#252;n i&#231;inde doluyor'
+        cs_90 = '31-90 g&#252;n i&#231;inde doluyor'
+        cs_365 = '91-365 g&#252;n i&#231;inde doluyor'
+        cs_later = 'Bir y&#305;ldan uzun ge&#231;erli'
+        f_roles = 'Roller'
+        f_all = 'T&#252;m&#252;'
+        f_dates = 'Yaln&#305;zca ge&#231;mi&#351; veya 90 g&#252;n i&#231;indeki tarihler'
+        f_search = 'Sunucu, &#252;r&#252;n, s&#252;r&#252;m, sertifika ara...'
+        f_reset = 'S&#305;f&#305;rla'
+        f_print = 'Yazd&#305;r / PDF'
+        f_hint = 'Filtreler detay tablolar&#305;na ve sunucu kartlar&#305;na uygulan&#305;r; &#246;zet her zaman rapor kapsam&#305;n&#305;n tamam&#305;n&#305; g&#246;sterir.'
+        m_dates = 'Destek ve destek sonu tarihleri, rapor olu&#351;turulurken yaln&#305;zca &#252;reticilerin resmi sayfalar&#305;ndan okunur; her tarihin kayna&#287;&#305; ve al&#305;nma zaman&#305; a&#351;a&#287;&#305;da listelenir.'
+        m_approx = '(yakla&#351;&#305;k) olarak i&#351;aretli kurulum tarihleri klas&#246;r veya dosya olu&#351;turulma zamanlar&#305;d&#305;r.'
+        m_certs = 'Sertifikalar LocalMachine\My ve WebHosting depolar&#305;ndan okunur; ''Kullan&#305;mda'', sertifikan&#305;n bir IIS sitesine ba&#287;l&#305; oldu&#287;unu g&#246;sterir.'
+        m_readonly = 'Salt okunur envanter: hi&#231;bir sunucuda de&#287;i&#351;iklik yap&#305;lmad&#305;.'
+        m_noeol = '''Biti&#351; tarihi ilan edilmedi'', &#252;reticinin resmi sayfas&#305;n&#305;n s&#252;r&#252;m&#252; biti&#351; tarihi olmadan desteklenen olarak listeledi&#287;i anlam&#305;na gelir.'
+        offline = 'resmi sayfan&#305;n &#231;evrimd&#305;&#351;&#305; kopyas&#305;'
+        approx = '(yakla&#351;&#305;k)'
+        none = 'Tespit edilmedi'
+        in_days = '{0} g&#252;n sonra'
+        days_ago = '{0} g&#252;n &#246;nce'
+        today = 'bug&#252;n'
+        rescan = 'Detaylar i&#231;in v1.5 veya sonras&#305; ile yeniden taray&#305;n'
+        more = 've {0} tane daha'
+        page_note = 'Server Wizard v{0}'
+    }
+}
+
+# ============================================================================
+# Readable report (v1.6): one model, rendered as a static, print-ready HTML
+# page (light JS only filters / sorts what is already on the page) and
+# printed to PDF with the local Edge / Chrome in headless mode.
+# The report only SHOWS facts: no advice, no scores. Every lifecycle date
+# carries its official source and retrieval time.
+# ============================================================================
+$script:RptLang = 'en'
+
+function T([string]$key) {
+    $d = $script:ReportText[$script:RptLang]
+    # Strings are stored ASCII-safe (&#NNN;) and returned as plain text;
+    # every value is HTML-encoded once where it is written into the page
+    $v = if ($d -and $d.ContainsKey($key)) { $d[$key] } else { $script:ReportText['en'][$key] }
+    return [Net.WebUtility]::HtmlDecode("$v")
+}
+function HE($v) { return [Net.WebUtility]::HtmlEncode("$v") }
+
+function Format-RptDate($d) {
+    if (-not $d) { return '' }
+    $dt = $null
+    if ($d -is [datetime]) { $dt = $d } else { $dt = ConvertTo-LcDate ((("$d" -split ' ')[0])) }
+    if (-not $dt) { return "$d" }
+    if ($script:RptLang -eq 'tr') { return $dt.ToString('dd.MM.yyyy') }
+    return $dt.ToString('yyyy-MM-dd')
+}
+function Get-SortKey($d) {
+    if (-not $d) { return '' }
+    $dt = if ($d -is [datetime]) { $d } else { ConvertTo-LcDate ((("$d" -split ' ')[0])) }
+    if ($dt) { return $dt.ToString('yyyyMMdd') }
+    return "$d"
+}
+function Format-RptDays($days) {
+    if ($null -eq $days -or "$days" -eq '') { return '' }
+    $n = [int]$days
+    if ($n -eq 0) { return (T 'today') }
+    if ($n -gt 0) { return ((T 'in_days') -f $n) }
+    return ((T 'days_ago') -f (-$n))
+}
+
+# Neutral status key for an OS / DB / IIS lifecycle result
+function Get-StatusKey($lc) {
+    if (-not $lc) { return 'st_unknown' }
+    $s = "$($lc.Status)"
+    if ($s -like 'EOL (paid ESU*') { return 'st_esu' }
+    if ($s -like 'EOL*')           { return 'st_eol' }
+    if ($s -like 'Extended*')      { return 'st_extended' }
+    if ($s -like 'Supported (no*') { return 'st_noeol' }
+    if ($s -like 'Supported*')     { return 'st_supported' }
+    return 'st_unknown'
+}
+function Get-StatusTone([string]$key) {
+    switch ($key) {
+        'st_supported' { 'ok' }   'st_noeol' { 'ok' }   'cs_later' { 'ok' }   'cs_365' { 'ok' }
+        'st_extended'  { 'warn' } 'cs_90'    { 'soon' } 'cs_30'    { 'warn' }
+        'st_eol'       { 'bad' }  'st_esu'   { 'bad' }  'cs_expired' { 'bad' }
+        default        { 'mute' }
+    }
+}
+function Get-CertKey($days) {
+    if ($null -eq $days) { return 'st_unknown' }
+    if ($days -lt 0)   { return 'cs_expired' }
+    if ($days -le 30)  { return 'cs_30' }
+    if ($days -le 90)  { return 'cs_90' }
+    if ($days -le 365) { return 'cs_365' }
+    return 'cs_later'
+}
+# A row is "dated soon" when a shown date has passed or falls within 90 days
+function Test-Soon($days) { return ($null -ne $days -and "$days" -ne '' -and [int]$days -le 90) }
+
+function Get-OsShortName($r, $lc) {
+    if ($lc -and $lc.Product -and $lc.Product -notlike 'Windows build*') { return $lc.Product }
+    $inv = Get-Inv $r
+    $cap = if ($inv -and $inv.OS) { "$($inv.OS.Caption)" } else { ("$($r.OperatingSystem)" -replace '\s*\(.*$', '') }
+    return ($cap -replace '^Microsoft\s+', '' -replace '\s+(Standard|Datacenter|Essentials|Evaluation).*$', '')
+}
+
+# Builds everything the report shows, for the given servers and roles
+function Get-ReportModel([string[]]$keys, [string[]]$Roles = @()) {
+    $m = @{
+        Keys = $keys; Roles = @($Roles); Groups = [ordered]@{}; ServerGroups = @{}
+        Lifecycle = New-Object System.Collections.Generic.List[object]
+        Certs     = New-Object System.Collections.Generic.List[object]
+        Sources   = @{}
+    }
+    foreach ($g in $script:GroupOrder) { $m.Groups[$g] = New-Object System.Collections.Generic.List[string] }
+    foreach ($k in $keys) {
+        $gs = @(Get-EffectiveGroups $k $script:Results[$k] | Where-Object { @($Roles).Count -eq 0 -or $Roles -contains $_ })
+        $m.ServerGroups[$k] = $gs
+        foreach ($g in $gs) { if (-not $m.Groups.Contains($g)) { $m.Groups[$g] = New-Object System.Collections.Generic.List[string] }; $m.Groups[$g].Add($k) }
+    }
+    $addSrc = {
+        param($lc)
+        if ($lc -and $lc.Source -and -not $m.Sources.ContainsKey($lc.Source)) { $m.Sources[$lc.Source] = $lc.SourceNote }
+    }
+    foreach ($k in $keys) {
+        $r = $script:Results[$k]; $inv = Get-Inv $r
+        $osLc = Get-Lc (Get-OsLifecycleKey $r); & $addSrc $osLc
+        $m.Lifecycle.Add([PSCustomObject]@{
+            Server = $k; Category = 'OS'; Name = (Get-OsShortName $r $osLc); Version = $(if ($inv -and $inv.OS) { "$($inv.OS.Build)$(if ($inv.OS.UBR) { ".$($inv.OS.UBR)" })" } else { '' })
+            Edition = $(if ($inv -and $inv.OS) { "$($inv.OS.Caption)" } else { "$($r.OperatingSystem)" })
+            Installed = "$($r.InstallDate)"; Approx = $false; State = ''
+            Lc = $osLc; StatusKey = (Get-StatusKey $osLc)
+        })
+        if ($inv -and $inv.IIS) {
+            $iisLc = Get-Lc (Get-IisLifecycleKey $r); & $addSrc $iisLc
+            $m.Lifecycle.Add([PSCustomObject]@{
+                Server = $k; Category = 'IIS'; Name = "IIS $(("$($inv.IIS.Version)") -replace '\.0$', '')"; Version = "$($inv.IIS.VersionString)"
+                Edition = "$($inv.IIS.SiteCount) site(s)"; Installed = "$($inv.IIS.InstallDate)"; Approx = $true; State = ''
+                Lc = $iisLc; StatusKey = (Get-StatusKey $iisLc); Sites = @($inv.IIS.Sites | Where-Object { $_ })
+            })
+        }
+        if ($inv) {
+            foreach ($db in @($inv.Databases | Where-Object { $_ })) {
+                $lc = Get-Lc (Get-DbLifecycleKey $db); & $addSrc $lc
+                $nm = if ($lc -and $lc.Release) { $lc.Release } else { "$($db.Product)" }
+                $m.Lifecycle.Add([PSCustomObject]@{
+                    Server = $k; Category = 'DB'; Name = $nm; Product = "$($db.Product)"; Version = "$($db.Version)"
+                    Edition = (@("$($db.Edition)", "$($db.Instance)") | Where-Object { $_ }) -join ' / '
+                    Installed = "$($db.InstallDate)"; Approx = ("$($db.InstallDateSource)" -match 'approx|creation'); State = "$($db.ServiceState)"
+                    Lc = $lc; StatusKey = $(if ($lc) { Get-StatusKey $lc } else { 'st_unknown' })
+                })
+            }
+            foreach ($c in @($inv.Certificates | Where-Object { $_ })) {
+                $days = Get-DaysLeft $c.NotAfter
+                $name = if (@($c.DnsNames | Where-Object { $_ }).Count) { @($c.DnsNames)[0] } elseif ($c.FriendlyName) { $c.FriendlyName } else { ($c.Subject -replace '^CN=', '' -replace ',.*$', '') }
+                $m.Certs.Add([PSCustomObject]@{
+                    Server = $k; Name = $name; Subject = $c.Subject; Issuer = ($c.Issuer -replace '^CN=', '' -replace ',.*$', '')
+                    Expires = $c.NotAfter; Days = $days; Key = (Get-CertKey $days); InUse = @($c.BoundTo | Where-Object { $_ })
+                    Store = $c.Store; SelfSigned = $c.SelfSigned; Sans = @($c.DnsNames | Where-Object { $_ })
+                })
+            }
+        }
+    }
+    return $m
+}
+
+function Get-RolesAttr($m, [string]$server) { return (HE ((@($m.ServerGroups[$server]) -join '|'))) }
+
+# --- small HTML builders ------------------------------------------------------
+function New-RptBars($title, $pairs, [string]$toneMap = '') {
+    # $pairs: ordered dictionary label -> count (labels are trusted/encoded by caller)
+    $max = 0; foreach ($v in $pairs.Values) { if ($v -gt $max) { $max = $v } }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<div class=""panel""><h3>$title</h3>")
+    if ($pairs.Count -eq 0) { [void]$sb.Append("<p class=""muted"">$(T 'none')</p></div>"); return $sb.ToString() }
+    [void]$sb.Append('<table class="bars">')
+    foreach ($k in $pairs.Keys) {
+        $v = $pairs[$k]; $w = if ($max -gt 0) { [math]::Max(2, [math]::Round(100 * $v / $max)) } else { 0 }
+        $tone = 'blue'
+        if ($toneMap -and $k -match '^<span data-tone="(\w+)"') { $tone = $matches[1] }
+        [void]$sb.Append("<tr><td class=""bl"">$k</td><td class=""bb""><span class=""bar $tone"" style=""width:$w%""></span></td><td class=""bn"">$v</td></tr>")
+    }
+    [void]$sb.Append('</table></div>')
+    return $sb.ToString()
+}
+
+function New-RptTable([string[]]$headers, $rows, [string]$id) {
+    # $rows: list of @{ Attrs = '...'; Cells = @( @{ H = html; S = sortkey; C = class } ) }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<div class=""tw""><table class=""grid"" id=""$id""><thead><tr>")
+    foreach ($h in $headers) { [void]$sb.Append("<th>$h</th>") }
+    [void]$sb.Append('</tr></thead><tbody>')
+    foreach ($row in $rows) {
+        [void]$sb.Append("<tr $($row.Attrs)>")
+        foreach ($c in $row.Cells) {
+            $cls = if ($c.C) { " class=""$($c.C)""" } else { '' }
+            $srt = if ($null -ne $c.S -and "$($c.S)" -ne '') { " data-sort=""$(HE $c.S)""" } else { '' }
+            [void]$sb.Append("<td$cls$srt>$($c.H)</td>")
+        }
+        [void]$sb.Append('</tr>')
+    }
+    [void]$sb.Append('</tbody></table></div>')
+    if (@($rows).Count -eq 0) { return "<p class=""muted"">$(T 'none')</p>" }
+    return $sb.ToString()
+}
+function Cell($html, $sort = $null, $cls = $null) { return @{ H = $html; S = $sort; C = $cls } }
+function StatusCell([string]$key) { return (Cell "<span class=""pill $(Get-StatusTone $key)"">$(T $key)</span>" $key) }
+function SrcCell($lc) {
+    if (-not $lc -or -not $lc.Source) { return (Cell '') }
+    $u = "$($lc.Source)"
+    if ($u -match '^https://([^/]+)/' -and $script:OfficialHosts -contains $matches[1]) {
+        return (Cell "<a href=""$(HE $u)"" target=""_blank"" rel=""noopener"">$(HE $matches[1])</a>")
+    }
+    return (Cell (HE $u))
+}
+function DaysCell($days) { return (Cell (HE (Format-RptDays $days)) $(if ($null -ne $days -and "$days" -ne '') { [int]$days + 100000 } else { '' }) 'nw') }
+function DateCell($d) { return (Cell (HE (Format-RptDate $d)) (Get-SortKey $d) 'nw') }
+
+function New-LcRow($m, $it, [switch]$WithServer) {
+    $lc = $it.Lc
+    $days = if ($lc) { $lc.DaysToEOL } else { $null }
+    $inst = (Format-RptDate $it.Installed)
+    if ($inst -and $it.Approx) { $inst += " $(T 'approx')" }
+    $cells = @()
+    if ($WithServer) { $cells += (Cell "<b>$(HE $it.Server)</b>" $it.Server) }
+    $cells += (Cell (HE $it.Name))
+    $cells += (Cell (HE $it.Version) $it.Version 'nw')
+    $cells += (Cell (HE $it.Edition))
+    $cells += (Cell (HE $inst) (Get-SortKey $it.Installed) 'nw')
+    $cells += (DateCell $(if ($lc) { $lc.SupportEnd }))
+    $cells += (DateCell $(if ($lc) { $lc.EOL }))
+    $cells += (DaysCell $days)
+    $cells += (StatusCell $it.StatusKey)
+    $cells += (SrcCell $lc)
+    $soon = if (Test-Soon $days) { '1' } else { '0' }
+    return @{ Attrs = "data-roles=""$(Get-RolesAttr $m $it.Server)"" data-soon=""$soon"""; Cells = $cells }
+}
+
+function ConvertTo-ReadableReport($m, [string]$lang = 'en', [string]$scopeText = '') {
+    $script:RptLang = if ($lang -eq 'tr') { 'tr' } else { 'en' }
+    $now = Get-Date
+    $sb  = New-Object System.Text.StringBuilder
+    $lcHeaders = @((T 'c_product'), (T 'c_version'), (T 'c_edition'), (T 'c_installed'), (T 'c_support'), (T 'c_eol'), (T 'c_days'), (T 'c_status'), (T 'c_source'))
+    $os  = @($m.Lifecycle | Where-Object { $_.Category -eq 'OS' })
+    $dbs = @($m.Lifecycle | Where-Object { $_.Category -eq 'DB' })
+    $iis = @($m.Lifecycle | Where-Object { $_.Category -eq 'IIS' })
+    $groupsUsed = @($m.Groups.Keys | Where-Object { $m.Groups[$_].Count -gt 0 })
+
+    # ---- head + toolbar ---------------------------------------------------
+    [void]$sb.Append("<!DOCTYPE html><html lang=""$($script:RptLang)""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width, initial-scale=1"">")
+    [void]$sb.Append("<title>$(T 'title')</title><style>$($script:ReportCss)</style></head><body>")
+    $by = "$env:USERDOMAIN\$env:USERNAME"
+    [void]$sb.Append("<header class=""cover""><div><h1>$(T 'title')</h1>")
+    [void]$sb.Append("<p>$((T 'generated') -f (HE $now.ToString($(if ($script:RptLang -eq 'tr') { 'dd.MM.yyyy HH:mm' } else { 'yyyy-MM-dd HH:mm' }))), (HE $by), (HE $env:COMPUTERNAME))</p>")
+    [void]$sb.Append("<p><b>$(T 'scope'):</b> $(HE $scopeText) &middot; $((T 'servers_n') -f $m.Keys.Count)</p></div>")
+    [void]$sb.Append("<div class=""brand"">$((T 'page_note') -f (HE $script:AppVersion))</div></header>")
+
+    [void]$sb.Append('<div class="fbar noprint"><div class="row"><span class="lbl">' + (T 'f_roles') + '</span>')
+    [void]$sb.Append("<button type=""button"" class=""chip"" data-role="""" aria-pressed=""true"">$(T 'f_all')</button>")
+    foreach ($g in $groupsUsed) { [void]$sb.Append("<button type=""button"" class=""chip"" data-role=""$(HE $g)"" aria-pressed=""false"">$(HE $g) <span class=""n"">$($m.Groups[$g].Count)</span></button>") }
+    [void]$sb.Append('</div><div class="row">')
+    [void]$sb.Append("<button type=""button"" class=""chip"" id=""soon"" aria-pressed=""false"">$(T 'f_dates')</button>")
+    [void]$sb.Append("<input type=""search"" id=""q"" placeholder=""$(T 'f_search')"">")
+    [void]$sb.Append("<button type=""button"" class=""btn"" id=""reset"">$(T 'f_reset')</button><button type=""button"" class=""btn pri"" id=""print"">$(T 'f_print')</button>")
+    [void]$sb.Append("<span class=""hint"">$(T 'f_hint')</span></div></div><main>")
+
+    # ---- TOC ----------------------------------------------------------------
+    $toc = [ordered]@{ summary = (T 's_summary'); calendar = (T 's_calendar'); os = (T 's_os') }
+    if ($dbs.Count) { $toc['db'] = (T 's_db') }
+    if ($iis.Count) { $toc['iis'] = (T 's_iis') }
+    $toc['roles'] = (T 's_roles'); $toc['certs'] = (T 's_certs'); $toc['cards'] = (T 's_cards'); $toc['appendix'] = (T 's_appendix')
+    [void]$sb.Append("<nav class=""toc""><b>$(T 'toc')</b>")
+    $n = 0; foreach ($k in $toc.Keys) { $n++; [void]$sb.Append("<a href=""#$k"">$n. $($toc[$k])</a>") }
+    [void]$sb.Append('</nav>')
+
+    # ---- 1. Summary -----------------------------------------------------------
+    $osNames = [ordered]@{}; foreach ($o in ($os | Sort-Object Name)) { $l = HE $o.Name; if (-not $osNames.Contains($l)) { $osNames[$l] = 0 }; $osNames[$l]++ }
+    $dbNames = [ordered]@{}; foreach ($d in ($dbs | Sort-Object Name, Version)) {
+        $l = HE $(if ($d.Lc -and $d.Lc.Release) { $d.Lc.Release } else { "$($d.Product) $((("$($d.Version)" -split '\.')[0..1]) -join '.')" })
+        if (-not $dbNames.Contains($l)) { $dbNames[$l] = 0 }; $dbNames[$l]++ }
+    $kpi = @(
+        @((T 'k_servers'), $m.Keys.Count), @((T 'k_roles'), $groupsUsed.Count), @((T 'k_os'), $osNames.Count),
+        @((T 'k_db'), $dbs.Count), @((T 'k_certs'), $m.Certs.Count)
+    )
+    [void]$sb.Append("<section id=""summary""><h2>1. $(T 's_summary')</h2><p class=""muted"">$(T 'summary_note')</p><div class=""kpis"">")
+    foreach ($k in $kpi) { [void]$sb.Append("<div class=""kpi""><b>$($k[1])</b><span>$($k[0])</span></div>") }
+    [void]$sb.Append('</div><div class="panels">')
+    $rolePairs = [ordered]@{}; foreach ($g in $groupsUsed) { $rolePairs[(HE $g)] = $m.Groups[$g].Count }
+    [void]$sb.Append((New-RptBars (T 'd_roles') $rolePairs))
+    [void]$sb.Append((New-RptBars (T 'd_os') $osNames))
+    [void]$sb.Append((New-RptBars (T 'd_db') $dbNames))
+    $stPairs = [ordered]@{}
+    foreach ($sk in 'st_supported', 'st_noeol', 'st_extended', 'st_esu', 'st_eol', 'st_unknown') {
+        $c = @($m.Lifecycle | Where-Object { $_.StatusKey -eq $sk }).Count
+        if ($c) { $stPairs["<span data-tone=""$(Get-StatusTone $sk)"">$(T $sk)</span>"] = $c }
+    }
+    [void]$sb.Append((New-RptBars (T 'd_status') $stPairs 'tone'))
+    $cPairs = [ordered]@{}
+    foreach ($ck in 'cs_expired', 'cs_30', 'cs_90', 'cs_365', 'cs_later') {
+        $c = @($m.Certs | Where-Object { $_.Key -eq $ck }).Count
+        if ($c) { $cPairs["<span data-tone=""$(Get-StatusTone $ck)"">$(T $ck)</span>"] = $c }
+    }
+    [void]$sb.Append((New-RptBars (T 'd_certs') $cPairs 'tone'))
+    [void]$sb.Append('</div></section>')
+
+    # ---- 2. Calendar (next 12 months) -------------------------------------------
+    $start = New-Object DateTime -ArgumentList $now.Year, $now.Month, 1
+    $end   = $start.AddMonths(12)
+    $events = New-Object System.Collections.Generic.List[object]
+    $addEv = {
+        param($date, $evKey, $name, $server)
+        if ($date -and $date -ge $start -and $date -lt $end) { $events.Add([PSCustomObject]@{ Date = ([datetime]$date).Date; Ev = $evKey; Name = $name; Server = $server }) }
+    }
+    foreach ($it in $m.Lifecycle) {
+        if (-not $it.Lc) { continue }
+        if ($it.Lc.SupportEnd -and $it.Lc.EOL -and ([datetime]$it.Lc.SupportEnd).Date -ne ([datetime]$it.Lc.EOL).Date) { & $addEv $it.Lc.SupportEnd 'ev_support' $it.Name $it.Server }
+        & $addEv $it.Lc.EOL 'ev_eol' $it.Name $it.Server
+        & $addEv $it.Lc.ESUEnd 'ev_esu' $it.Name $it.Server
+    }
+    foreach ($c in $m.Certs) { $d = ConvertTo-LcDate ((("$($c.Expires)" -split ' ')[0])); & $addEv $d 'ev_cert' $c.Name $c.Server }
+    $culture = if ($script:RptLang -eq 'tr') { [Globalization.CultureInfo]::GetCultureInfo('tr-TR') } else { [Globalization.CultureInfo]::GetCultureInfo('en-US') }
+    [void]$sb.Append("<section id=""calendar"" class=""pb""><h2>2. $(T 's_calendar')</h2><p class=""muted"">$(T 'cal_note')</p><div class=""cal"">")
+    for ($i = 0; $i -lt 12; $i++) {
+        $ms = $start.AddMonths($i); $me = $ms.AddMonths(1)
+        $mev = @($events | Where-Object { $_.Date -ge $ms -and $_.Date -lt $me })
+        [void]$sb.Append("<div class=""mon""><h4>$(HE $culture.TextInfo.ToTitleCase($ms.ToString('MMMM yyyy', $culture)))</h4>")
+        if ($mev.Count -eq 0) { [void]$sb.Append("<p class=""muted"">$(T 'cal_none')</p></div>"); continue }
+        [void]$sb.Append('<ul>')
+        foreach ($grp in ($mev | Group-Object Date, Ev, Name | Sort-Object { $_.Group[0].Date }, { $_.Group[0].Name })) {
+            $e0 = $grp.Group[0]
+            $srvs = @($grp.Group | ForEach-Object { $_.Server } | Sort-Object -Unique)
+            $roles = HE ((@($srvs | ForEach-Object { $m.ServerGroups[$_] } | ForEach-Object { $_ } | Sort-Object -Unique)) -join '|')
+            $list = if ($srvs.Count -le 6) { $srvs -join ', ' } else { (($srvs[0..5]) -join ', ') + ' ' + ((T 'more') -f ($srvs.Count - 6)) }
+            $tone = if ($e0.Ev -eq 'ev_cert') { 'cert' } else { 'lc' }
+            [void]$sb.Append("<li data-roles=""$roles"" data-soon=""1"" class=""$tone""><span class=""dd"">$(HE (Format-RptDate $e0.Date))</span> <b>$(HE $e0.Name)</b> &middot; $(T $e0.Ev)<br><span class=""muted"">$(HE $list)</span></li>")
+        }
+        [void]$sb.Append('</ul></div>')
+    }
+    [void]$sb.Append('</div></section>')
+
+    # ---- 3. Operating systems -------------------------------------------------
+    $sec = 3
+    [void]$sb.Append("<section id=""os"" class=""pb""><h2>$sec. $(T 's_os')</h2>")
+    $rows = foreach ($it in ($os | Sort-Object Name, Server)) {
+        $r = $script:Results[$it.Server]
+        $lc = $it.Lc
+        $days = if ($lc) { $lc.DaysToEOL } else { $null }
+        @{ Attrs = "data-roles=""$(Get-RolesAttr $m $it.Server)"" data-soon=""$(if (Test-Soon $days) { '1' } else { '0' })"""
+           Cells = @((Cell "<b>$(HE $it.Server)</b>" $it.Server), (Cell (HE (@($m.ServerGroups[$it.Server]) -join ', '))), (Cell (HE $it.Name)),
+                     (Cell (HE $it.Version) $it.Version 'nw'), (DateCell $it.Installed), (DateCell "$($r.LastRestartDate)"),
+                     (DateCell $(if ($lc) { $lc.SupportEnd })), (DateCell $(if ($lc) { $lc.EOL })), (DateCell $(if ($lc) { $lc.ESUEnd })),
+                     (DaysCell $days), (StatusCell $it.StatusKey), (SrcCell $lc)) }
+    }
+    [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_roles'), (T 'c_os'), (T 'c_build'), (T 'c_installed'), (T 'c_restart'), (T 'c_mainstream'), (T 'c_eol'), (T 'c_esu'), (T 'c_days'), (T 'c_status'), (T 'c_source')) @($rows) 't-os'))
+    [void]$sb.Append('</section>')
+
+    # ---- 4. Databases ------------------------------------------------------------
+    if ($dbs.Count) {
+        $sec++
+        [void]$sb.Append("<section id=""db"" class=""pb""><h2>$sec. $(T 's_db')</h2>")
+        $rows = foreach ($it in ($dbs | Sort-Object Product, Version, Server)) { New-LcRow $m $it -WithServer }
+        [void]$sb.Append((New-RptTable (@((T 'c_server')) + $lcHeaders) @($rows) 't-db'))
+        [void]$sb.Append('</section>')
+    }
+    # ---- 5. IIS -------------------------------------------------------------------
+    if ($iis.Count) {
+        $sec++
+        [void]$sb.Append("<section id=""iis"" class=""pb""><h2>$sec. $(T 's_iis')</h2>")
+        $rows = foreach ($it in ($iis | Sort-Object Name, Server)) {
+            $row = New-LcRow $m $it -WithServer
+            $row.Cells[3] = (Cell (HE ((@($it.Sites) -join ', '))))
+            $row
+        }
+        $h = @((T 'c_server')) + $lcHeaders; $h[3] = (T 'c_sites')
+        [void]$sb.Append((New-RptTable $h @($rows) 't-iis'))
+        [void]$sb.Append('</section>')
+    }
+
+    # ---- Role views ----------------------------------------------------------------
+    $sec++
+    [void]$sb.Append("<section id=""roles"" class=""pb""><h2>$sec. $(T 's_roles')</h2>")
+    foreach ($g in $groupsUsed) {
+        $def = $script:RoleDefs | Where-Object { $_.Group -eq $g } | Select-Object -First 1
+        [void]$sb.Append("<div class=""rolev"" data-roles=""$(HE $g)""><h3>$(HE $g) <span class=""muted"">&middot; $((T 'servers_n') -f $m.Groups[$g].Count)</span></h3>")
+        $rows = foreach ($k in ($m.Groups[$g] | Sort-Object)) {
+            $r = $script:Results[$k]; $inv = Get-Inv $r
+            $osIt = $os | Where-Object { $_.Server -eq $k } | Select-Object -First 1
+            $svc = ''
+            if ($g -eq 'SQL / Database') {
+                $svc = (@($dbs | Where-Object { $_.Server -eq $k } | ForEach-Object { "$($_.Product) $($_.Version)" }) -join ', ')
+            } elseif ($g -eq 'IIS / Web') {
+                $svc = (@($iis | Where-Object { $_.Server -eq $k } | ForEach-Object { "$($_.Name): $((@($_.Sites) -join ', '))" }) -join ', ')
+            } elseif ($inv -and $def -and $def.Features) {
+                $svc = (@(Get-FeatureRows $inv $def | ForEach-Object { $_.DisplayName }) -join ', ')
+            } else { $svc = "$($r.ThirdPartyServices)" }
+            $days = if ($osIt -and $osIt.Lc) { $osIt.Lc.DaysToEOL } else { $null }
+            @{ Attrs = "data-roles=""$(HE $g)"" data-soon=""$(if (Test-Soon $days) { '1' } else { '0' })"""
+               Cells = @((Cell "<b>$(HE $k)</b>" $k), (Cell (HE $svc)), (Cell (HE $(if ($osIt) { $osIt.Name }))),
+                         (DateCell $(if ($osIt -and $osIt.Lc) { $osIt.Lc.EOL })), (StatusCell $(if ($osIt) { $osIt.StatusKey } else { 'st_unknown' }))) }
+        }
+        [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_role_services'), (T 'c_os'), (T 'c_eol'), (T 'c_status')) @($rows) ("t-role-" + ($g -replace '[^A-Za-z0-9]', ''))))
+        [void]$sb.Append('</div>')
+    }
+    [void]$sb.Append('</section>')
+
+    # ---- Certificates ------------------------------------------------------------------
+    $sec++
+    [void]$sb.Append("<section id=""certs"" class=""pb""><h2>$sec. $(T 's_certs')</h2>")
+    $rows = foreach ($c in ($m.Certs | Sort-Object @{ Expression = { if ($null -eq $_.Days) { [int]::MaxValue } else { $_.Days } } }, Server)) {
+        $use = if ($c.InUse.Count) { (T 'yes') + ': ' + (HE ($c.InUse -join ', ')) } else { (T 'no') }
+        @{ Attrs = "data-roles=""$(Get-RolesAttr $m $c.Server)"" data-soon=""$(if (Test-Soon $c.Days) { '1' } else { '0' })"""
+           Cells = @((Cell "<b>$(HE $c.Server)</b>" $c.Server), (Cell ("$(HE $c.Name)" + $(if ($c.Sans.Count -gt 1) { "<br><span class=""muted"">$(HE (($c.Sans | Select-Object -Skip 1) -join ', '))</span>" } else { '' }))),
+                     (Cell (HE $c.Issuer)), (DateCell $c.Expires), (DaysCell $c.Days), (Cell $use $(if ($c.InUse.Count) { '1' } else { '0' })), (StatusCell $c.Key), (Cell (HE $c.Store))) }
+    }
+    [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_name'), (T 'c_issuer'), (T 'c_expires'), (T 'c_days'), (T 'c_inuse'), (T 'c_status'), (T 'c_store')) @($rows) 't-certs'))
+    [void]$sb.Append('</section>')
+
+    # ---- Server cards ---------------------------------------------------------------------
+    $sec++
+    [void]$sb.Append("<section id=""cards"" class=""pb""><h2>$sec. $(T 's_cards')</h2>")
+    foreach ($k in ($m.Keys | Sort-Object)) {
+        $r = $script:Results[$k]; $inv = Get-Inv $r
+        $osIt = $os | Where-Object { $_.Server -eq $k } | Select-Object -First 1
+        $soon = @($m.Lifecycle | Where-Object { $_.Server -eq $k -and $_.Lc -and (Test-Soon $_.Lc.DaysToEOL) }).Count + @($m.Certs | Where-Object { $_.Server -eq $k -and (Test-Soon $_.Days) }).Count
+        [void]$sb.Append("<article class=""card"" id=""srv-$(HE $k)"" data-roles=""$(Get-RolesAttr $m $k)"" data-soon=""$(if ($soon) { '1' } else { '0' })"">")
+        [void]$sb.Append("<div class=""ch""><h3>$(HE $k)</h3><div>")
+        foreach ($g in @($m.ServerGroups[$k])) { [void]$sb.Append("<span class=""tag"">$(HE $g)</span>") }
+        [void]$sb.Append('</div></div><dl class="kv">')
+        $kv = [ordered]@{}
+        $kv[(T 'c_os')]        = HE ("$(if ($osIt) { $osIt.Edition }) $(if ($osIt -and $osIt.Version) { "($(T 'c_build') $($osIt.Version))" })")
+        $kv[(T 'c_installed')] = HE (Format-RptDate "$($r.InstallDate)")
+        $kv[(T 'c_restart')]   = HE (Format-RptDate "$($r.LastRestartDate)")
+        if ($osIt -and $osIt.Lc) {
+            $kv[(T 'c_mainstream')] = HE (Format-RptDate $osIt.Lc.SupportEnd)
+            $kv[(T 'c_eol')]        = "$(HE (Format-RptDate $osIt.Lc.EOL)) <span class=""pill $(Get-StatusTone $osIt.StatusKey)"">$(T $osIt.StatusKey)</span>"
+        }
+        $kv[(T 'c_ip')]    = HE ("$($r.IPAddresses)" -replace ';\s*', ', ')
+        $kv[(T 'c_ports')] = HE ("$($r.ListeningPorts)")
+        if ($inv) {
+            $roleTxt = @($inv.Features | Where-Object { $_ -and $_.Type -eq 'Role' } | ForEach-Object {
+                $role = $_
+                $svcs = @($inv.Features | Where-Object { $_ -and $_.Type -eq 'Role Service' -and $_.Parent -eq $role.Name } | ForEach-Object { $_.DisplayName })
+                "$($role.DisplayName)" + $(if ($svcs) { " ($($svcs -join ', '))" } else { '' })
+            })
+            $kv[(T 'c_rolesvc')] = if ($roleTxt) { HE ($roleTxt -join '; ') } else { T 'none' }
+            $feat = @($inv.Features | Where-Object { $_ -and $_.Type -eq 'Feature' -and $_.Depth -le 1 } | ForEach-Object { $_.DisplayName })
+            $kv[(T 'c_features')] = if ($feat) { HE ($feat -join ', ') } else { T 'none' }
+        } else { $kv[(T 'c_rolesvc')] = T 'rescan' }
+        foreach ($kk in $kv.Keys) { [void]$sb.Append("<dt>$kk</dt><dd>$($kv[$kk])</dd>") }
+        [void]$sb.Append('</dl>')
+        $prod = @($m.Lifecycle | Where-Object { $_.Server -eq $k -and $_.Category -ne 'OS' })
+        if ($prod.Count) {
+            $rows = foreach ($it in $prod) { New-LcRow $m $it }
+            [void]$sb.Append((New-RptTable $lcHeaders @($rows) "t-card-$(HE $k)-p"))
+        }
+        $cs = @($m.Certs | Where-Object { $_.Server -eq $k } | Sort-Object Days)
+        if ($cs.Count) {
+            $rows = foreach ($c in $cs) {
+                @{ Attrs = "data-soon=""$(if (Test-Soon $c.Days) { '1' } else { '0' })"""
+                   Cells = @((Cell (HE $c.Name)), (DateCell $c.Expires), (DaysCell $c.Days), (Cell $(if ($c.InUse.Count) { (T 'yes') + ': ' + (HE ($c.InUse -join ', ')) } else { T 'no' })), (StatusCell $c.Key)) }
+            }
+            [void]$sb.Append((New-RptTable @((T 'c_name'), (T 'c_expires'), (T 'c_days'), (T 'c_inuse'), (T 'c_status')) @($rows) "t-card-$(HE $k)-c"))
+        }
+        [void]$sb.Append('</article>')
+    }
+    [void]$sb.Append('</section>')
+
+    # ---- Appendix: sources, method, classification ---------------------------------------
+    $sec++
+    [void]$sb.Append("<section id=""appendix"" class=""pb""><h2>$sec. $(T 's_appendix')</h2><ul class=""method"">")
+    foreach ($mk in 'm_dates', 'm_noeol', 'm_approx', 'm_certs', 'm_readonly') { [void]$sb.Append("<li>$(T $mk)</li>") }
+    [void]$sb.Append('</ul>')
+    $rows = foreach ($u in ($m.Sources.Keys | Sort-Object)) {
+        $note = "$($m.Sources[$u])"
+        $when = if ($note -match '(\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?)') { $matches[1] } else { $note }
+        $txt  = HE $when
+        if ($note -match 'offline') { $txt += " &middot; $(T 'offline')" }
+        @{ Attrs = ''; Cells = @((Cell "<a href=""$(HE $u)"" target=""_blank"" rel=""noopener"">$(HE $u)</a>"), (Cell $txt $when 'nw')) }
+    }
+    [void]$sb.Append((New-RptTable @((T 'c_url'), (T 'c_retrieved')) @($rows) 't-src'))
+    [void]$sb.Append("<h3>$(T 's_evidence')</h3>")
+    $rows = foreach ($k in ($m.Keys | Sort-Object)) {
+        if ($script:Overrides.ContainsKey($k)) {
+            @{ Attrs = "data-roles=""$(Get-RolesAttr $m $k)"""; Cells = @((Cell (HE $k) $k), (Cell (HE $script:Overrides[$k])), (Cell 'Manual override')) }
+            continue
+        }
+        foreach ($d in @(Get-RoleGroupDetails $script:Results[$k])) {
+            if (@($m.Roles).Count -and $m.Roles -notcontains $d.Group) { continue }
+            @{ Attrs = "data-roles=""$(HE $d.Group)"""; Cells = @((Cell (HE $k) $k), (Cell (HE $d.Group)), (Cell (HE $d.Reason))) }
+        }
+    }
+    [void]$sb.Append((New-RptTable @((T 'c_server'), (T 'c_group'), (T 'c_evidence')) @($rows) 't-evidence'))
+    [void]$sb.Append("</section></main><footer>$((T 'page_note') -f (HE $script:AppVersion)) &middot; $(T 'm_readonly')</footer>")
+    [void]$sb.Append("<script>$($script:ReportJs)</script></body></html>")
+    return $sb.ToString()
+}
+
+$script:ReportCss = @'
+:root{--blue:#1f3a93;--blue-lt:#eef2fc;--ink:#1d2433;--muted:#5f6b7a;--line:#dde2ea;--row:#fafbfd;
+--ok:#1e7b4b;--ok-bg:#e5f4ec;--warn:#9a5b00;--warn-bg:#fff1d6;--soon:#7a6a00;--soon-bg:#fff9cf;--bad:#a8261b;--bad-bg:#fbe6e4;--mute:#5f6b7a;--mute-bg:#eef0f3}
+*{box-sizing:border-box}
+html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{font-family:'Segoe UI',Arial,sans-serif;color:var(--ink);margin:0;background:#fff;font-size:13px;line-height:1.45}
+.cover{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;background:var(--blue-lt);border-bottom:3px solid var(--blue);padding:22px 32px}
+.cover h1{margin:0 0 6px;color:var(--blue);font-size:26px}
+.cover p{margin:2px 0;color:var(--muted)} .brand{color:var(--blue);font-weight:600;white-space:nowrap}
+.fbar{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid var(--line);padding:10px 32px;box-shadow:0 2px 6px rgba(31,58,147,.06)}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center} .row+.row{margin-top:8px}
+.lbl{font-size:12px;color:var(--muted);min-width:46px}
+.chip{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:999px;padding:4px 12px;font:inherit;font-size:12.5px;cursor:pointer}
+.chip:hover{border-color:var(--blue)} .chip[aria-pressed=true]{background:var(--blue);border-color:var(--blue);color:#fff}
+.chip .n{opacity:.7;font-size:11px;margin-left:3px}
+input[type=search]{border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit;width:300px;max-width:100%}
+.btn{border:1px solid var(--blue);background:#fff;color:var(--blue);border-radius:6px;padding:5px 12px;font:inherit;font-size:12.5px;cursor:pointer}
+.btn.pri{background:var(--blue);color:#fff} .hint{font-size:11.5px;color:var(--muted);margin-left:6px}
+main{padding:6px 32px 32px;max-width:1500px}
+.toc{display:flex;flex-wrap:wrap;gap:6px 16px;margin:16px 0 4px;font-size:13px} .toc a{color:var(--blue);text-decoration:none} .toc a:hover{text-decoration:underline}
+section{margin-top:28px} h2{color:var(--blue);font-size:19px;margin:0 0 4px;padding-bottom:5px;border-bottom:2px solid var(--blue-lt)}
+h3{font-size:14.5px;margin:16px 0 6px;color:var(--ink)} .muted{color:var(--muted)}
+.kpis{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
+.kpi{border:1px solid var(--line);border-radius:8px;padding:10px 18px;min-width:140px} .kpi b{display:block;font-size:26px;color:var(--blue)} .kpi span{font-size:12px;color:var(--muted)}
+.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px}
+.panel{border:1px solid var(--line);border-radius:8px;padding:10px 14px;break-inside:avoid} .panel h3{margin:2px 0 8px;font-size:13.5px}
+table.bars{width:100%;border-collapse:collapse} .bars td{padding:3px 4px;font-size:12px;vertical-align:middle}
+.bl{width:46%} .bb{width:44%} .bn{width:10%;text-align:right;font-weight:600}
+.bar{display:block;height:10px;border-radius:5px;background:var(--blue)} .bar.ok{background:var(--ok)} .bar.warn{background:#d08a1a} .bar.soon{background:#c4b100} .bar.bad{background:var(--bad)} .bar.mute{background:#9aa4b2}
+.cal{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.mon{border:1px solid var(--line);border-radius:8px;padding:8px 12px;break-inside:avoid} .mon h4{margin:0 0 6px;color:var(--blue);font-size:13px}
+.mon ul{margin:0;padding:0;list-style:none} .mon li{padding:5px 0 5px 8px;border-left:3px solid var(--blue);margin:4px 0;font-size:12px}
+.mon li.cert{border-left-color:#d08a1a} .dd{font-weight:600;font-variant-numeric:tabular-nums}
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:6px;margin:6px 0 4px}
+table.grid{border-collapse:collapse;width:100%;font-size:12px}
+.grid th{background:var(--blue);color:#fff;text-align:left;padding:7px 8px;white-space:nowrap;cursor:pointer;user-select:none}
+.grid th .ar{font-size:9px;margin-left:4px} .grid td{border-top:1px solid var(--line);padding:5px 8px;vertical-align:top}
+.grid tr:nth-child(even) td{background:var(--row)} .nw{white-space:nowrap}
+.grid td a{color:var(--blue)}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap}
+.pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.warn{background:var(--warn-bg);color:var(--warn)} .pill.soon{background:var(--soon-bg);color:var(--soon)}
+.pill.bad{background:var(--bad-bg);color:var(--bad)} .pill.mute{background:var(--mute-bg);color:var(--mute)}
+.card{border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:12px 0;break-inside:avoid}
+.ch{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px} .ch h3{margin:0;color:var(--blue);font-size:15px}
+.tag{display:inline-block;background:var(--blue-lt);color:var(--blue);border-radius:4px;padding:1px 7px;font-size:11.5px;margin:2px 0 2px 4px}
+dl.kv{display:grid;grid-template-columns:200px 1fr;gap:3px 14px;margin:10px 0} dl.kv dt{color:var(--muted)} dl.kv dd{margin:0}
+ul.method{padding-left:18px} ul.method li{margin:3px 0}
+.hidden{display:none!important} mark{background:#fff3a3;padding:0}
+footer{color:var(--muted);font-size:11px;padding:8px 32px 24px;border-top:1px solid var(--line)}
+@page{size:A4 landscape;margin:12mm}
+@media print{.noprint{display:none!important}body{font-size:11px}.cover{padding:14px 18px}main{padding:0 6px;max-width:none}
+section.pb{break-before:page}.tw{overflow:visible;border:none}.grid th{background:var(--blue)!important}thead{display:table-header-group}tr{break-inside:avoid}.card{break-inside:avoid}}
+'@
+
+$script:ReportJs = @'
+(function(){"use strict";
+var S={roles:[],soon:false,q:""};
+function $(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));}
+function rolesOk(el){if(!S.roles.length)return true;var a=el.getAttribute("data-roles");if(a===null)return true;
+ var rs=a.split("|");for(var i=0;i<rs.length;i++)if(S.roles.indexOf(rs[i])>=0)return true;return false;}
+function soonOk(el){if(!S.soon)return true;var s=el.getAttribute("data-soon");return s===null||s==="1";}
+function textOk(el){if(!S.q)return true;return el.textContent.toLowerCase().indexOf(S.q)>=0;}
+function apply(){
+ $("[data-roles],[data-soon]").forEach(function(el){if(el.closest(".fbar"))return;
+  var show=rolesOk(el)&&soonOk(el)&&(el.tagName==="TR"||el.tagName==="LI"||el.tagName==="ARTICLE"?textOk(el):true);
+  el.classList.toggle("hidden",!show);});
+ $(".mon").forEach(function(m){var any=$("li",m).some(function(li){return !li.classList.contains("hidden");});m.classList.toggle("hidden",(S.roles.length||S.soon||S.q)&&!any);});
+ $(".chip[data-role]").forEach(function(b){var r=b.getAttribute("data-role");b.setAttribute("aria-pressed",String(r===""?S.roles.length===0:S.roles.indexOf(r)>=0));});
+ document.getElementById("soon").setAttribute("aria-pressed",String(S.soon));
+ var h=[];if(S.roles.length)h.push("roles="+S.roles.map(encodeURIComponent).join(","));if(S.soon)h.push("soon=1");
+ try{history.replaceState(null,"",h.length?"#"+h.join("&"):location.pathname+location.search);}catch(e){}}
+$(".chip[data-role]").forEach(function(b){b.addEventListener("click",function(e){var g=b.getAttribute("data-role");
+ if(g===""){S.roles=[];}else{var i=S.roles.indexOf(g);if(e.ctrlKey||e.metaKey||e.shiftKey){if(i>=0)S.roles.splice(i,1);else S.roles.push(g);}else{S.roles=(S.roles.length===1&&i===0)?[]:[g];}}
+ apply();});});
+document.getElementById("soon").addEventListener("click",function(){S.soon=!S.soon;apply();});
+var q=document.getElementById("q"),t;q.addEventListener("input",function(){clearTimeout(t);t=setTimeout(function(){S.q=q.value.trim().toLowerCase();apply();},180);});
+document.getElementById("reset").addEventListener("click",function(){S={roles:[],soon:false,q:""};q.value="";apply();});
+document.getElementById("print").addEventListener("click",function(){window.print();});
+$("table.grid").forEach(function(tb){$("th",tb).forEach(function(th,ci){th.title="Sort";th.addEventListener("click",function(){
+ var body=tb.tBodies[0],rows=Array.prototype.slice.call(body.rows),dir=th.getAttribute("data-dir")==="1"?-1:1;
+ $("th",tb).forEach(function(x){x.removeAttribute("data-dir");var a=x.querySelector(".ar");if(a)a.remove();});
+ th.setAttribute("data-dir",dir===1?"1":"-1");var ar=document.createElement("span");ar.className="ar";ar.textContent=dir===1?"\u25B2":"\u25BC";th.appendChild(ar);
+ function key(r){var c=r.cells[ci];if(!c)return"";var s=c.getAttribute("data-sort");return s!==null?s:c.textContent.trim();}
+ rows.sort(function(a,b){var x=key(a),y=key(b);if(x===""&&y!=="")return 1;if(y===""&&x!=="")return -1;
+  if(/^-?\d+(\.\d+)?$/.test(x)&&/^-?\d+(\.\d+)?$/.test(y))return dir*(parseFloat(x)-parseFloat(y));
+  return dir*x.localeCompare(y,undefined,{numeric:true,sensitivity:"base"});});
+ rows.forEach(function(r){body.appendChild(r);});});});});
+(function(){var h=location.hash.replace(/^#/,"");if(!h)return;h.split("&").forEach(function(p){var kv=p.split("=");
+ if(kv[0]==="roles"&&kv[1])S.roles=kv[1].split(",").map(decodeURIComponent);if(kv[0]==="soon")S.soon=kv[1]==="1";});})();
+apply();
+})();
+'@
+
+# --- PDF via the local Edge / Chrome (headless print) ------------------------
+function Find-HeadlessBrowser {
+    $cands = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
+    )
+    foreach ($app in 'msedge.exe', 'chrome.exe') {
+        try {
+            $p = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$app" -ErrorAction Stop).'(default)'
+            if ($p) { $cands += $p.Trim('"') }
+        } catch {}
+    }
+    foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+    return $null
+}
+
+function Convert-HtmlToPdf([string]$htmlPath, [string]$pdfPath) {
+    $browser = Find-HeadlessBrowser
+    if (-not $browser) { throw "Microsoft Edge or Google Chrome was not found on this machine; the HTML report can be printed to PDF from any browser." }
+    $profileDir = Join-Path $env:TEMP ("ServerWizard_pdf_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    try {
+        if (Test-Path -LiteralPath $pdfPath) { Remove-Item -LiteralPath $pdfPath -Force -ErrorAction Stop }
+        $uri  = ([Uri]$htmlPath).AbsoluteUri
+        $argLine = "--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-extensions " +
+                "--user-data-dir=""$profileDir"" --no-pdf-header-footer --print-to-pdf-no-header " +
+                "--print-to-pdf=""$pdfPath"" ""$uri"""
+        Write-Log "PDF: $browser $argLine"
+        $p = Start-Process -FilePath $browser -ArgumentList $argLine -PassThru -WindowStyle Hidden
+        if (-not $p.WaitForExit(120000)) { try { $p.Kill() } catch {}; throw "PDF conversion timed out after 120 s." }
+        $deadline = (Get-Date).AddSeconds(10)
+        while (-not (Test-Path -LiteralPath $pdfPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        if (-not (Test-Path -LiteralPath $pdfPath) -or (Get-Item -LiteralPath $pdfPath).Length -eq 0) {
+            throw "The browser did not produce a PDF (exit code $($p.ExitCode))."
+        }
+    }
+    finally {
+        # Only the temporary browser profile this function created
+        if ($profileDir -like (Join-Path $env:TEMP 'ServerWizard_pdf_*')) { Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -3040,7 +3876,7 @@ function Show-ExportDialog {
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     $dlg.StartPosition = 'CenterParent'
-    $dlg.ClientSize = New-Object System.Drawing.Size(470, 520)
+    $dlg.ClientSize = New-Object System.Drawing.Size(470, 580)
     $dlg.Font = $form.Font
     $dlg.BackColor = [System.Drawing.Color]::White
     $dlg.ShowInTaskbar = $false
@@ -3082,38 +3918,51 @@ function Show-ExportDialog {
 
     $grpFmt = New-Object System.Windows.Forms.GroupBox
     $grpFmt.Text = 'Format'; $grpFmt.ForeColor = $script:MerlinBlue
-    $grpFmt.Location = New-Object System.Drawing.Point(14, 346); $grpFmt.Size = New-Object System.Drawing.Size(442, 100)
+    $grpFmt.Location = New-Object System.Drawing.Point(14, 346); $grpFmt.Size = New-Object System.Drawing.Size(442, 124)
     $rbHtml = New-Object System.Windows.Forms.RadioButton
-    $rbHtml.Text = 'Interactive HTML report (role filters, search, sorting)'; $rbHtml.ForeColor = [System.Drawing.Color]::Black
+    $rbHtml.Text = 'HTML (opens in the browser; filters, search, Print / PDF button)'; $rbHtml.ForeColor = [System.Drawing.Color]::Black
     $rbHtml.Location = New-Object System.Drawing.Point(12, 22); $rbHtml.AutoSize = $true; $rbHtml.Checked = $true
-    $rbCsv = New-Object System.Windows.Forms.RadioButton
-    $rbCsv.Text = 'CSV files, one per role / section'; $rbCsv.ForeColor = [System.Drawing.Color]::Black
-    $rbCsv.Location = New-Object System.Drawing.Point(12, 46); $rbCsv.AutoSize = $true
+    $rbPdf = New-Object System.Windows.Forms.RadioButton
+    $rbPdf.Text = 'PDF (A4 landscape, printed with Edge / Chrome)'; $rbPdf.ForeColor = [System.Drawing.Color]::Black
+    $rbPdf.Location = New-Object System.Drawing.Point(12, 46); $rbPdf.AutoSize = $true
+    $rbBoth = New-Object System.Windows.Forms.RadioButton
+    $rbBoth.Text = 'HTML + PDF (same name, side by side)'; $rbBoth.ForeColor = [System.Drawing.Color]::Black
+    $rbBoth.Location = New-Object System.Drawing.Point(12, 70); $rbBoth.AutoSize = $true
     $rbTab = New-Object System.Windows.Forms.RadioButton
     $rbTab.Text = if ($tabOk) { "Active tab only (CSV): $($activeTab.Text)" } else { 'Active tab only (CSV) - open a server or search tab first' }
     $rbTab.ForeColor = [System.Drawing.Color]::Black
-    $rbTab.Location = New-Object System.Drawing.Point(12, 70); $rbTab.AutoSize = $true; $rbTab.Enabled = $tabOk
-    $grpFmt.Controls.AddRange(@($rbHtml, $rbCsv, $rbTab))
-    $toggle = { $clb.Enabled = -not $rbTab.Checked; $grpSrv.Enabled = -not $rbTab.Checked }
+    $rbTab.Location = New-Object System.Drawing.Point(12, 94); $rbTab.AutoSize = $true; $rbTab.Enabled = $tabOk
+    $grpFmt.Controls.AddRange(@($rbHtml, $rbPdf, $rbBoth, $rbTab))
+
+    $lblLang = New-Object System.Windows.Forms.Label
+    $lblLang.Text = 'Report language'; $lblLang.ForeColor = $script:MerlinBlue; $lblLang.AutoSize = $true
+    $lblLang.Location = New-Object System.Drawing.Point(16, 486)
+    $cmbLang = New-Object System.Windows.Forms.ComboBox
+    $cmbLang.DropDownStyle = 'DropDownList'
+    $cmbLang.Location = New-Object System.Drawing.Point(140, 482); $cmbLang.Size = New-Object System.Drawing.Size(160, 24)
+    [void]$cmbLang.Items.Add("T$([char]0x00FC)rk$([char]0x00E7)e"); [void]$cmbLang.Items.Add('English')
+    $cmbLang.SelectedIndex = if ($script:ReportLangDefault -eq 'en') { 1 } else { 0 }
+
+    $toggle = { $clb.Enabled = -not $rbTab.Checked; $grpSrv.Enabled = -not $rbTab.Checked; $cmbLang.Enabled = -not $rbTab.Checked }
     $rbTab.Add_CheckedChanged($toggle)
 
     $btnView = New-Object System.Windows.Forms.Button
     $btnView.Text = 'Open in-app view'; $btnView.FlatStyle = 'Flat'; $btnView.ForeColor = $script:MerlinBlue
-    $btnView.Location = New-Object System.Drawing.Point(14, 470); $btnView.Size = New-Object System.Drawing.Size(140, 32)
+    $btnView.Location = New-Object System.Drawing.Point(14, 532); $btnView.Size = New-Object System.Drawing.Size(140, 32)
     $btnView.DialogResult = [System.Windows.Forms.DialogResult]::Retry
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = 'Cancel'; $btnCancel.FlatStyle = 'Flat'
-    $btnCancel.Location = New-Object System.Drawing.Point(254, 470); $btnCancel.Size = New-Object System.Drawing.Size(90, 32)
+    $btnCancel.Location = New-Object System.Drawing.Point(254, 532); $btnCancel.Size = New-Object System.Drawing.Size(90, 32)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text = 'Export'; $btnOk.FlatStyle = 'Flat'
     $btnOk.BackColor = $script:MerlinYellow; $btnOk.ForeColor = $script:MerlinBlue
     $btnOk.Font = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
-    $btnOk.Location = New-Object System.Drawing.Point(354, 470); $btnOk.Size = New-Object System.Drawing.Size(102, 32)
+    $btnOk.Location = New-Object System.Drawing.Point(354, 532); $btnOk.Size = New-Object System.Drawing.Size(102, 32)
     $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $dlg.AcceptButton = $btnOk; $dlg.CancelButton = $btnCancel
 
-    $dlg.Controls.AddRange(@($lblRoles, $lnkAll, $lnkNone, $clb, $grpSrv, $grpFmt, $btnView, $btnCancel, $btnOk))
+    $dlg.Controls.AddRange(@($lblRoles, $lnkAll, $lnkNone, $clb, $grpSrv, $grpFmt, $lblLang, $cmbLang, $btnView, $btnCancel, $btnOk))
 
     try {
         $res = $dlg.ShowDialog($form)
@@ -3127,9 +3976,11 @@ function Show-ExportDialog {
         }
         # Every role ticked = no role filter (also keeps servers with no group)
         if ($roles.Count -eq $clb.Items.Count) { $roles = @() }
+        $script:ReportLangDefault = if ($cmbLang.SelectedIndex -eq 0) { 'tr' } else { 'en' }
         return @{
             Action     = 'Report'
-            Format     = if ($rbCsv.Checked) { 'Csv' } else { 'Html' }
+            Format     = if ($rbPdf.Checked) { 'Pdf' } elseif ($rbBoth.Checked) { 'Both' } else { 'Html' }
+            Language   = if ($cmbLang.SelectedIndex -eq 0) { 'tr' } else { 'en' }
             Roles      = [string[]]$roles
             AllServers = [bool]$rbAll.Checked
         }
@@ -3146,8 +3997,8 @@ $btnExport.Add_Click({
             'View'   { Open-ReportsTab }
             'Tab'    { Export-ActiveTabCsv }
             'Report' {
-                Write-Log "Export: $($choice.Format), roles: $(if ($choice.Roles.Count) { $choice.Roles -join ', ' } else { 'all' }), all servers: $($choice.AllServers)"
-                Invoke-RoleReport -Format $choice.Format -Roles $choice.Roles -AllServers:$choice.AllServers
+                Write-Log "Export: $($choice.Format) [$($choice.Language)], roles: $(if ($choice.Roles.Count) { $choice.Roles -join ', ' } else { 'all' }), all servers: $($choice.AllServers)"
+                Invoke-RoleReport -Format $choice.Format -Roles $choice.Roles -AllServers:$choice.AllServers -Language $choice.Language
             }
         }
     }
