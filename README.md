@@ -11,10 +11,13 @@ Scan every Windows Server in your Active Directory domain over WinRM and browse 
 - **Per-server tabs**: click a server to open its full inventory in its own closable tab
 - **Categorised search**: type an IP, website, DNS name, port, software or user name and instantly see which server it lives on. Results open with a summary of how many matches were found per category (SSL bindings, IIS websites, DNS names, installed software, services, ports…), then list them grouped by category and server, with matches highlighted. Narrow a search to a single category from the dropdown, or click a category in the summary to filter to it
 - **Collected data**: OS + version, install/last restart dates, IPs, CPU/RAM, disks with free-space warnings, roles & features, automatic services, last RDP logons, IIS sites + DNS names + modules + SSL bindings (with certificate dates), listening ports, SQL instance details (edition/version), database services, Microsoft and 3rd-party software with versions, running 3rd-party services
-- **Role-based reporting** (`Export Report` menu):
-  - **HTML report** for all selected servers: KPI summary (OS / DB past EOL, expired and soon-expiring certificates), servers per role, and a section per role
+- **Role-based reporting** (`Export Report` opens one dialog):
+  - choose the **roles** (e.g. only IIS, only SQL, or IIS + SQL) and the **servers** (checked in the list or all scanned) that go into the report
+  - **Interactive HTML report** (single offline file, no external resources): role chips (click = only that role, Ctrl/Shift+click = combine), "Problems only" filter (EOL / extended support / expired or expiring certificates), free-text search with highlighting, sortable columns, per-section "Download view (CSV)", KPIs that follow the filter, and a bookmarkable view in the address bar (`report.html#roles=IIS%20%2F%20Web&problems=1`)
   - **CSV per role / section** (semicolon-delimited, UTF-8 BOM, formula-injection safe) into a folder
   - **Active tab only (CSV)**: the v1.4 per-server / search-result export
+  - **Open in-app view**: a `Reports` tab with a section selector, a sortable, colour-coded grid (double-click a row to open the server) and export / refresh buttons
+- **Role classification evidence**: every placement shows why (Windows role, database engine with its instance, or service), in the server tab and in the report's *Role Classification* section. Database packages without a service (client tools, drivers) are listed but do not make a server a database server
 - **Role details in reports and server tabs**:
   - *Operating system*: version, build, install date, Microsoft Lifecycle policy, mainstream end, extended end (EOL), paid ESU end, days to EOL, status
   - *Databases*: product (Microsoft SQL Server, MariaDB, MySQL, PostgreSQL, Firebird, MongoDB, Oracle, Redis), version, edition / instance, service pack, install date, service state, vendor support end / EOL

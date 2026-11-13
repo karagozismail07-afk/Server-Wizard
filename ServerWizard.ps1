@@ -5,6 +5,7 @@
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Data
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # Win32 helper for flicker-free rendering and scroll-to-top
@@ -31,7 +32,7 @@ function Set-DoubleBuffered($ctrl) {
 }
 
 # --- Version ---------------------------------------------------------------
-$script:AppVersion = '1.5'
+$script:AppVersion = '1.5.1'
 
 # --- UI font: Open Sans if installed on this server, else Segoe UI ---------
 $script:FontName = 'Segoe UI'
@@ -515,7 +516,7 @@ $script:FieldDefs = @(
     @{ Name='LogicalCores';       Section='Hardware';            Label='Logical Cores';               Sep=$null  },
     @{ Name='TotalRAM_GB';        Section='Hardware';            Label='Total RAM (GB)';              Sep=$null  },
     @{ Name='Disks';              Section='Disks';               Label='Disks';                       Sep=' | '  },
-    @{ Name='RoleGroupsText';     Section='Roles & Features';    Label='Detected Role Groups';        Sep='; ';   Derived=$true },
+    @{ Name='RoleGroupsText';     Section='Roles & Features';    Label='Detected Role Groups (with evidence)'; Sep='; '; Derived=$true },
     @{ Name='RolesDetail';        Section='Roles & Features';    Label='Windows Server Roles & Role Services'; Sep=' ;; '; Derived=$true },
     @{ Name='FeaturesDetail';     Section='Roles & Features';    Label='Windows Server Features';     Sep=' ;; '; Derived=$true },
     @{ Name='Roles';              Section='Roles & Features';    Label='Installed Roles';             Sep='; '   },
@@ -576,32 +577,54 @@ function Get-Inv($r) {
     return $inv
 }
 
-function Get-RoleGroups($r) {
-    $groups   = New-Object System.Collections.Generic.List[string]
+# Classification with evidence: returns one @{ Group; Reason } per matched
+# group, so every placement can be verified in the server tab and reports.
+function Get-RoleGroupDetails($r) {
+    $out      = New-Object System.Collections.Generic.List[object]
     $inv      = Get-Inv $r
-    $features = @()
-    if ($inv -and $inv.Features) { $features = @($inv.Features | Where-Object { $_ } | ForEach-Object { "$($_.Name)" }) }
-    else { $features = @("$($r.Roles)" -split ';\s*' | Where-Object { $_ -and $_ -ne 'N/A' }) }
+    $featObjs = @()
+    if ($inv -and $inv.Features) { $featObjs = @($inv.Features | Where-Object { $_ }) }
+    $features = if ($featObjs) { @($featObjs | ForEach-Object { "$($_.Name)" }) }
+                else { @("$($r.Roles)" -split ';\s*' | Where-Object { $_ -and $_ -ne 'N/A' }) }
     $tpSvc = "$($r.ThirdPartyServices)"
 
     foreach ($def in $script:RoleDefs) {
-        $hit = $false
-        foreach ($f in $def.Features) { if ($features -contains $f) { $hit = $true; break } }
-        if (-not $hit -and $def.Services -and $tpSvc -match $def.Services) { $hit = $true }
-        if (-not $hit -and $def.Group -eq 'SQL / Database') {
-            if ($inv -and @($inv.Databases | Where-Object { $_ }).Count -gt 0) { $hit = $true }
+        $reason = $null
+        $hitF = @($def.Features | Where-Object { $features -contains $_ })
+        if ($hitF) {
+            $names = foreach ($f in $hitF) {
+                $o = $featObjs | Where-Object { $_.Name -eq $f } | Select-Object -First 1
+                if ($o) { "$($o.DisplayName) [$f]" } else { $f }
+            }
+            $reason = "Windows role: $($names -join ', ')"
+        }
+        if (-not $reason -and $def.Services -and $tpSvc -match $def.Services) { $reason = "Service matches '$($def.Services)'" }
+        if (-not $reason -and $def.Group -eq 'SQL / Database') {
+            if ($inv) {
+                # Only real database SERVERS: an engine with a service/instance.
+                # Client tools / drivers without a service do not classify.
+                $engines = @($inv.Databases | Where-Object { $_ -and "$($_.Instance)" -ne '(no service)' })
+                if ($engines) {
+                    $reason = 'Database engine: ' + (($engines | ForEach-Object { "$($_.Product) $($_.Version) [$($_.Instance)]" }) -join ', ')
+                }
+            }
             else {
                 $sql = "$($r.SQLInstanceDetails)"
-                if (($sql -and $sql -notin 'None', 'N/A') -or "$($r.DatabaseServices)" -match 'SQL Server \(') { $hit = $true }
+                if (($sql -and $sql -notin 'None', 'N/A') -or "$($r.DatabaseServices)" -match 'SQL Server \(') { $reason = "SQL instance (v1.4 data): $sql" }
             }
         }
-        if (-not $hit -and $def.Group -eq 'IIS / Web' -and "$($r.Websites)" -and "$($r.Websites)" -notmatch '^(N/A|No sites)') { $hit = $true }
-        if ($hit) { $groups.Add($def.Group) }
+        if (-not $reason -and $def.Group -eq 'IIS / Web' -and "$($r.Websites)" -and "$($r.Websites)" -notmatch '^(N/A|No sites)') { $reason = 'IIS websites present' }
+        if ($reason) { $out.Add([PSCustomObject]@{ Group = $def.Group; Reason = $reason }) }
     }
-    if ($groups.Count -eq 0) {
-        if ($tpSvc -and $tpSvc -notin 'None', 'N/A') { $groups.Add('3rd Party') } else { $groups.Add('Other') }
+    if ($out.Count -eq 0) {
+        if ($tpSvc -and $tpSvc -notin 'None', 'N/A') { $out.Add([PSCustomObject]@{ Group = '3rd Party'; Reason = 'No Microsoft server role; running 3rd party services' }) }
+        else { $out.Add([PSCustomObject]@{ Group = 'Other'; Reason = 'No server role or 3rd party service detected' }) }
     }
-    return $groups.ToArray()    # enumerated: callers wrap with @()
+    return $out.ToArray()
+}
+
+function Get-RoleGroups($r) {
+    return @(Get-RoleGroupDetails $r | ForEach-Object { $_.Group })    # enumerated: callers wrap with @()
 }
 
 # Backward compatible single "primary" group (first match in display order)
@@ -1168,7 +1191,7 @@ function Update-DerivedFields($r) {
         $key  = "$($r.ComputerName)".ToUpper()
         $inv  = Get-Inv $r
         $vals = @{}
-        $vals.RoleGroupsText = @(Get-RoleGroups $r) -join '; '
+        $vals.RoleGroupsText = (@(Get-RoleGroupDetails $r) | ForEach-Object { "$($_.Group) <- $($_.Reason)" }) -join '; '
 
         $osLc = Get-Lc (Get-OsLifecycleKey $r)
         $vals.OSLifecycle = if ($osLc) {
@@ -1962,11 +1985,22 @@ function Invoke-Search {
 # ============================================================================
 
 # Servers in scope: checked in the tree and scanned; all scanned if none checked
-function Get-ReportServerKeys {
-    $checked = @(Get-AllLeafNodes | Where-Object { $_.Checked } | ForEach-Object { Get-LeafName $_ } |
-        Where-Object { $script:Results.ContainsKey($_) } | Sort-Object -Unique)
-    if ($checked.Count -gt 0) { return ,$checked }
-    return ,@($script:Results.Keys | Sort-Object)
+# Servers in scope: checked in the tree and scanned (all scanned if none are
+# checked, or when -AllServers); optionally only those in the given roles.
+function Get-ReportServerKeys([string[]]$Roles = @(), [switch]$AllServers) {
+    $base = @()
+    if (-not $AllServers) {
+        $base = @(Get-AllLeafNodes | Where-Object { $_.Checked } | ForEach-Object { Get-LeafName $_ } |
+            Where-Object { $script:Results.ContainsKey($_) } | Sort-Object -Unique)
+    }
+    if ($base.Count -eq 0) { $base = @($script:Results.Keys | Sort-Object) }
+    if (@($Roles).Count -gt 0) {
+        $base = @($base | Where-Object {
+            $gs = @(Get-EffectiveGroups $_ $script:Results[$_])
+            @($gs | Where-Object { $Roles -contains $_ }).Count -gt 0
+        })
+    }
+    return ,[string[]]$base
 }
 
 function Get-FeatureRows($inv, $def) {
@@ -1977,12 +2011,13 @@ function Get-FeatureRows($inv, $def) {
 
 # Builds every report section as rows of objects. Both the HTML and the CSV
 # writers render from this, so they always contain the same data.
-function Get-ReportSections([string[]]$keys) {
+function Get-ReportSections([string[]]$keys, [string[]]$Roles = @()) {
     $sections = [ordered]@{}
     $members  = [ordered]@{}
     foreach ($g in $script:GroupOrder) { $members[$g] = New-Object System.Collections.Generic.List[string] }
     foreach ($k in $keys) {
         foreach ($g in @(Get-EffectiveGroups $k $script:Results[$k])) {
+            if (@($Roles).Count -gt 0 -and $Roles -notcontains $g) { continue }   # role-scoped report
             if (-not $members.Contains($g)) { $members[$g] = New-Object System.Collections.Generic.List[string] }
             $members[$g].Add($k)
         }
@@ -1994,6 +2029,19 @@ function Get-ReportSections([string[]]$keys) {
         Rows = @(foreach ($g in $members.Keys) {
             if ($members[$g].Count -eq 0) { continue }
             [PSCustomObject]@{ 'Role Group' = $g; 'Servers' = $members[$g].Count; 'Server Names' = ($members[$g] -join ', ') }
+        })
+    }
+
+    # --- Classification evidence (why a server is in a group) ---------------
+    $sections['Role Classification'] = @{
+        Description = 'Why each server is in each role group (detected Windows role, database engine or service). Use it to verify the grouping.'
+        Rows = @(foreach ($k in $keys) {
+            $r = $script:Results[$k]
+            if ($script:Overrides.ContainsKey($k)) {
+                [PSCustomObject]@{ 'Server' = $k; 'Role Group' = $script:Overrides[$k]; 'Evidence' = 'Manual override (right-click)' }
+                continue
+            }
+            foreach ($d in @(Get-RoleGroupDetails $r)) { [PSCustomObject]@{ 'Server' = $k; 'Role Group' = $d.Group; 'Evidence' = $d.Reason } }
         })
     }
 
@@ -2162,92 +2210,238 @@ function Get-StatusClass([string]$v) {
     return ''
 }
 
+# Interactive single-file HTML report. All data is embedded as JSON and
+# rendered client-side with textContent (no HTML injection), no external
+# resources, works offline. Filters: role chips (multi-select), problem
+# filter, free-text search, sortable columns, per-section CSV of the view.
+# Deep link: report.html#roles=IIS%20%2F%20Web,SQL%20%2F%20Database&problems=1
 function ConvertTo-HtmlReport($sections, [string[]]$keys) {
     $enc = { param($v) [Net.WebUtility]::HtmlEncode("$v") }
-    $sb  = New-Object System.Text.StringBuilder
-    $now = Get-Date
-    $osRows   = @($sections['Operating Systems'].Rows)
-    $certRows = @($sections['SSL Certificates'].Rows)
-    $dbRows   = if ($sections.Contains('SQL / Database')) { @($sections['SQL / Database'].Rows) } else { @() }
-    $kpi = @(
-        @{ L = 'Servers';               V = $keys.Count; C = '' },
-        @{ L = 'OS past EOL';           V = @($osRows | Where-Object { $_.Status -match '^EOL' }).Count; C = 'bad' },
-        @{ L = 'DB engines past EOL';   V = @($dbRows | Where-Object { "$($_.Status)" -match '^EOL' }).Count; C = 'bad' },
-        @{ L = 'Certificates expired';  V = @($certRows | Where-Object { $_.Status -eq 'EXPIRED' }).Count; C = 'bad' },
-        @{ L = 'Certificates <= 30 days'; V = @($certRows | Where-Object { $_.Status -eq 'Expires <= 30 days' }).Count; C = 'warn' }
-    )
 
-    [void]$sb.Append(@"
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Server Wizard - Role Report</title>
-<style>
-:root{--blue:#1f3a93;--blue-lt:#e8eefc;--ink:#222;--muted:#666;--line:#d9dee8;--bad:#b42318;--bad-bg:#fde8e7;--warn:#9a5b00;--warn-bg:#fff1d6;--soon:#7a6a00;--soon-bg:#fffbd6;--ok:#00783c;--ok-bg:#e3f5ea}
-body{font-family:'Segoe UI',Arial,sans-serif;color:var(--ink);margin:0;background:#fff}
-header{background:var(--blue-lt);padding:18px 28px;border-bottom:3px solid var(--blue)}
-header h1{margin:0;color:var(--blue);font-size:24px} header p{margin:4px 0 0;color:var(--muted);font-size:13px}
-main{padding:12px 28px 40px}
-.kpis{display:flex;flex-wrap:wrap;gap:12px;margin:16px 0}
-.kpi{border:1px solid var(--line);border-radius:8px;padding:10px 16px;min-width:150px}
+    $serverGroups = @{}
+    foreach ($k in $keys) { $serverGroups[$k] = [string[]]@(Get-EffectiveGroups $k $script:Results[$k]) }
+    $groupNames = New-Object System.Collections.Generic.List[string]
+    foreach ($g in (@($script:GroupOrder) + @($serverGroups.Values | ForEach-Object { $_ }))) {
+        if (-not $groupNames.Contains($g) -and @($serverGroups.Values | Where-Object { $_ -contains $g }).Count) { $groupNames.Add($g) }
+    }
+
+    $secList = New-Object System.Collections.Generic.List[object]
+    foreach ($name in $sections.Keys) {
+        $sec  = $sections[$name]
+        $rows = @($sec.Rows)
+        $cols = New-Object System.Collections.Generic.List[string]
+        foreach ($row in $rows) { foreach ($p in $row.PSObject.Properties.Name) { if (-not $cols.Contains($p)) { $cols.Add($p) } } }
+        $data = New-Object System.Collections.Generic.List[object]
+        foreach ($row in $rows) {
+            $cells = [string[]]@(foreach ($c in $cols) {
+                $p = $row.PSObject.Properties[$c]
+                if ($p -and $null -ne $p.Value) { "$($p.Value)" } else { '' }
+            })
+            $data.Add($cells)
+        }
+        $secList.Add(@{
+            name = $name
+            desc = "$($sec.Description)"
+            role = if ($groupNames.Contains($name)) { $name } else { $null }
+            cols = $cols.ToArray()
+            rows = $data.ToArray()
+        })
+    }
+
+    $payload = @{
+        meta = @{
+            generated = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+            by        = "$env:USERDOMAIN\$env:USERNAME"
+            host      = "$env:COMPUTERNAME"
+            version   = "$($script:AppVersion)"
+            hosts     = [string[]]$script:OfficialHosts
+        }
+        groups   = $groupNames.ToArray()
+        servers  = $serverGroups
+        sections = $secList.ToArray()
+    }
+    # "</" can never close the <script> block; < > & are escaped as well
+    $json = ($payload | ConvertTo-Json -Depth 8 -Compress) -replace '</', '<\/' -replace '<!--', '<\!--'
+
+    $css = @'
+:root{--blue:#1f3a93;--blue-lt:#e8eefc;--ink:#1d2433;--muted:#5f6b7a;--line:#d9dee8;--bg:#fff;--row:#fafbfd;
+--bad:#b42318;--bad-bg:#fde8e7;--warn:#9a5b00;--warn-bg:#fff1d6;--soon:#7a6a00;--soon-bg:#fffbd6;--ok:#00783c;--ok-bg:#e3f5ea}
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',Arial,sans-serif;color:var(--ink);margin:0;background:var(--bg)}
+header{background:var(--blue-lt);padding:18px 28px 14px;border-bottom:3px solid var(--blue)}
+header h1{margin:0;color:var(--blue);font-size:24px}
+header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+.bar{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid var(--line);padding:10px 28px;box-shadow:0 2px 6px rgba(31,58,147,.06)}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.row+.row{margin-top:8px}
+.lbl{font-size:12px;color:var(--muted);margin-right:4px;min-width:42px}
+.chip{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:999px;padding:4px 11px;font:inherit;font-size:12.5px;cursor:pointer;line-height:1.4}
+.chip:hover{border-color:var(--blue)}
+.chip[aria-pressed=true]{background:var(--blue);border-color:var(--blue);color:#fff}
+.chip .n{opacity:.7;margin-left:4px;font-size:11px}
+.chip.prob[aria-pressed=true]{background:var(--bad);border-color:var(--bad)}
+input[type=search]{border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit;font-size:13px;width:280px;max-width:100%}
+.btn{border:1px solid var(--blue);background:#fff;color:var(--blue);border-radius:6px;padding:5px 10px;font:inherit;font-size:12px;cursor:pointer}
+.btn:hover{background:var(--blue-lt)}
+main{padding:8px 28px 40px}
+.kpis{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
+.kpi{border:1px solid var(--line);border-radius:8px;padding:10px 16px;min-width:150px;background:#fff;text-align:left;font:inherit;cursor:default}
 .kpi b{display:block;font-size:24px} .kpi span{font-size:12px;color:var(--muted)}
 .kpi.bad b{color:var(--bad)} .kpi.warn b{color:var(--warn)}
-nav{font-size:13px;margin:8px 0 18px} nav a{color:var(--blue);margin-right:14px;text-decoration:none}
-h2{color:var(--blue);font-size:18px;margin:28px 0 4px;border-bottom:1px solid var(--line);padding-bottom:4px}
-.desc{color:var(--muted);font-size:12px;margin:0 0 8px}
-.wrap{overflow-x:auto}
+nav{font-size:13px;margin:4px 0 6px;line-height:1.9} nav a{color:var(--blue);margin-right:14px;text-decoration:none;white-space:nowrap}
+nav a:hover{text-decoration:underline}
+section{margin-top:26px}
+.sh{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding-bottom:4px}
+h2{color:var(--blue);font-size:18px;margin:0}
+.cnt{font-size:12px;color:var(--muted)} .sh .btn{margin-left:auto}
+.desc{color:var(--muted);font-size:12px;margin:6px 0 8px}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:6px}
 table{border-collapse:collapse;font-size:12px;width:100%}
-th{background:var(--blue);color:#fff;text-align:left;padding:6px 8px;white-space:nowrap;position:sticky;top:0}
-td{border-bottom:1px solid var(--line);padding:5px 8px;vertical-align:top}
-tr:nth-child(even) td{background:#fafbfd}
+th{background:var(--blue);color:#fff;text-align:left;padding:7px 8px;white-space:nowrap;cursor:pointer;user-select:none;position:sticky;top:0}
+th:hover{background:#2a4bb5} th .ar{opacity:.85;margin-left:4px;font-size:10px}
+td{border-top:1px solid var(--line);padding:5px 8px;vertical-align:top}
+tr:nth-child(even) td{background:var(--row)}
 td.bad{background:var(--bad-bg)!important;color:var(--bad);font-weight:600}
 td.warn{background:var(--warn-bg)!important;color:var(--warn);font-weight:600}
 td.soon{background:var(--soon-bg)!important;color:var(--soon);font-weight:600}
 td.ok{background:var(--ok-bg)!important;color:var(--ok);font-weight:600}
-td a{color:var(--blue)} .empty{color:var(--muted);font-style:italic;font-size:12px}
+td a{color:var(--blue)} mark{background:#fff3a3;padding:0}
+.empty{color:var(--muted);font-style:italic;font-size:12px;padding:8px 0}
+.hidden{display:none!important}
 footer{color:var(--muted);font-size:11px;padding:0 28px 24px}
-@media print{th{position:static}.kpis{break-inside:avoid}}
-</style></head><body>
-<header><h1>Server Wizard &ndash; Role-Based Report</h1>
-<p>Generated $(& $enc $now.ToString('yyyy-MM-dd HH:mm')) by $(& $enc "$env:USERDOMAIN\$env:USERNAME") on $(& $enc $env:COMPUTERNAME) &middot; Server Wizard v$($script:AppVersion) &middot; $($keys.Count) server(s)</p></header>
-<main><div class="kpis">
-"@)
-    foreach ($k in $kpi) { [void]$sb.Append("<div class=""kpi $($k.C)""><b>$($k.V)</b><span>$(& $enc $k.L)</span></div>") }
-    [void]$sb.Append('</div><nav>')
-    $i = 0
-    foreach ($name in $sections.Keys) { $i++; [void]$sb.Append("<a href=""#s$i"">$(& $enc $name) ($(@($sections[$name].Rows).Count))</a>") }
-    [void]$sb.Append('</nav>')
+@media print{.bar,.sh .btn{display:none}th{position:static}section{break-inside:avoid-page}}
+'@
 
-    $i = 0
-    foreach ($name in $sections.Keys) {
-        $i++
-        $sec  = $sections[$name]
-        $rows = @($sec.Rows)
-        [void]$sb.Append("<h2 id=""s$i"">$(& $enc $name)</h2><p class=""desc"">$(& $enc $sec.Description)</p>")
-        if ($rows.Count -eq 0) { [void]$sb.Append('<p class="empty">No data.</p>'); continue }
-        $cols = @($rows[0].PSObject.Properties.Name)
-        foreach ($row in $rows) { foreach ($p in $row.PSObject.Properties.Name) { if ($cols -notcontains $p) { $cols += $p } } }
-        [void]$sb.Append('<div class="wrap"><table><thead><tr>')
-        foreach ($c in $cols) { [void]$sb.Append("<th>$(& $enc $c)</th>") }
-        [void]$sb.Append('</tr></thead><tbody>')
-        foreach ($row in $rows) {
-            [void]$sb.Append('<tr>')
-            foreach ($c in $cols) {
-                $p   = $row.PSObject.Properties[$c]
-                $val = if ($p -and $null -ne $p.Value) { "$($p.Value)" } else { '' }
-                $cls = if ($c -eq 'Status') { Get-StatusClass $val } else { '' }
-                $cell = & $enc $val
-                if ($val -match '^https://([^/]+)/' -and $script:OfficialHosts -contains $matches[1]) {
-                    $cell = "<a href=""$cell"" target=""_blank"" rel=""noopener"">$(& $enc $matches[1])</a>"
-                }
-                if ($cls) { [void]$sb.Append("<td class=""$cls"">$cell</td>") } else { [void]$sb.Append("<td>$cell</td>") }
-            }
-            [void]$sb.Append('</tr>')
-        }
-        [void]$sb.Append('</tbody></table></div>')
-    }
-    $srcs = ($script:OfficialHosts | ForEach-Object { & $enc $_ }) -join ', '
-    [void]$sb.Append("</main><footer>Support and EOL dates are read from official vendor sources only ($srcs) at report time. Install dates marked approx. are folder/binary creation times. Read-only inventory; no changes were made to any server.</footer></body></html>")
-    return $sb.ToString()
+    $js = @'
+(function(){
+"use strict";
+var D=JSON.parse(document.getElementById("sw-data").textContent);
+var S={roles:[],problems:false,q:""};
+var sortState={};
+function el(t,c,txt){var e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
+function cls(v){v=String(v||"");
+ if(/^(EOL|EXPIRED)/.test(v))return"bad";
+ if(/^(Extended support|Expires <= (30|60))/.test(v))return"warn";
+ if(/^Expires <= 90/.test(v))return"soon";
+ if(/^(Supported|Valid)/.test(v))return"ok";return"";}
+function isProblem(sec,row){var i=sec.cols.indexOf("Status");if(i<0)return false;var c=cls(row[i]);return c==="bad"||c==="warn"||c==="soon";}
+function serverIn(srv){if(!S.roles.length)return true;var g=D.servers[srv]||[];for(var i=0;i<g.length;i++)if(S.roles.indexOf(g[i])>=0)return true;return false;}
+function sectionVisible(sec){if(S.problems&&sec.cols.indexOf("Status")<0)return false;return !sec.role||!S.roles.length||S.roles.indexOf(sec.role)>=0;}
+function rowVisible(sec,row){
+ var gi=sec.cols.indexOf("Role Group"),si=sec.cols.indexOf("Server");
+ if(S.roles.length){
+  if(gi>=0&&S.roles.indexOf(row[gi])<0)return false;
+  if(gi<0&&si>=0&&!serverIn(row[si]))return false;}
+ if(S.problems&&sec.cols.indexOf("Status")>=0&&!isProblem(sec,row))return false;
+ if(S.q){var q=S.q.toLowerCase(),hit=false;for(var k=0;k<row.length;k++)if(String(row[k]).toLowerCase().indexOf(q)>=0){hit=true;break;}if(!hit)return false;}
+ return true;}
+function cmp(a,b){var na=parseFloat(a),nb=parseFloat(b);
+ if(/^-?\d+(\.\d+)?$/.test(a)&&/^-?\d+(\.\d+)?$/.test(b))return na-nb;
+ if(a===""&&b!=="")return 1;if(b===""&&a!=="")return -1;
+ return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:"base"});}
+function hostOk(u){var m=/^https:\/\/([^\/]+)\//.exec(u);return m&&D.meta.hosts.indexOf(m[1])>=0?m[1]:null;}
+function fillCell(td,val){var h=hostOk(val);
+ if(h){var a=el("a",null,h);a.href=val;a.target="_blank";a.rel="noopener";td.appendChild(a);return;}
+ if(S.q){var s=String(val),lo=s.toLowerCase(),q=S.q.toLowerCase(),p=0,i;
+  while((i=lo.indexOf(q,p))>=0){td.appendChild(document.createTextNode(s.slice(p,i)));td.appendChild(el("mark",null,s.slice(i,i+q.length)));p=i+q.length;}
+  td.appendChild(document.createTextNode(s.slice(p)));return;}
+ td.textContent=val;}
+function visibleRows(sec,idx){var rows=sec.rows.filter(function(r){return rowVisible(sec,r);});
+ var st=sortState[idx];if(st){rows=rows.slice().sort(function(a,b){return st.dir*cmp(a[st.col],b[st.col]);});}
+ return rows;}
+function csv(sec,rows){var esc=function(v){v=String(v==null?"":v);if(/^[=+\-@\t\r]/.test(v)&&!/^-?\d+(\.\d+)?$/.test(v))v="'"+v;return /[;"\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
+ var out=[sec.cols.map(esc).join(";")];rows.forEach(function(r){out.push(r.map(esc).join(";"));});
+ var blob=new Blob(["\ufeff"+out.join("\r\n")],{type:"text/csv;charset=utf-8"});
+ var a=el("a");a.href=URL.createObjectURL(blob);
+ a.download="ServerWizard_"+sec.name.replace(/[^A-Za-z0-9]+/g,"_").replace(/^_|_$/g,"")+(S.roles.length?"_"+S.roles.join("+").replace(/[^A-Za-z0-9+]+/g,""):"")+".csv";
+ document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},0);}
+function renderSection(sec,idx,host){
+ host.textContent="";
+ var rows=visibleRows(sec,idx);
+ var head=el("div","sh");head.appendChild(el("h2",null,sec.name));
+ head.appendChild(el("span","cnt",rows.length+" of "+sec.rows.length+" row(s)"));
+ var b=el("button","btn","Download view (CSV)");b.type="button";b.onclick=function(){csv(sec,rows);};head.appendChild(b);
+ host.appendChild(head);host.appendChild(el("p","desc",sec.desc));
+ if(!rows.length){host.appendChild(el("p","empty","No rows match the current filter."));return rows.length;}
+ var wrap=el("div","wrap"),t=el("table"),thead=el("thead"),tr=el("tr");
+ sec.cols.forEach(function(c,ci){var th=el("th",null,c);var st=sortState[idx];
+  if(st&&st.col===ci)th.appendChild(el("span","ar",st.dir>0?"\u25B2":"\u25BC"));
+  th.title="Sort by "+c;th.onclick=function(){var s=sortState[idx];sortState[idx]={col:ci,dir:(s&&s.col===ci)?-s.dir:1};renderSection(sec,idx,host);};
+  tr.appendChild(th);});
+ thead.appendChild(tr);t.appendChild(thead);
+ var tb=el("tbody"),si=sec.cols.indexOf("Status");
+ rows.forEach(function(r){var row=el("tr");r.forEach(function(v,ci){var td=el("td");if(ci===si){var c=cls(v);if(c)td.className=c;}fillCell(td,v);row.appendChild(td);});tb.appendChild(row);});
+ t.appendChild(tb);wrap.appendChild(t);host.appendChild(wrap);return rows.length;}
+function sec(name){for(var i=0;i<D.sections.length;i++)if(D.sections[i].name===name)return D.sections[i];return null;}
+function countRows(name,test){var s=sec(name);if(!s)return 0;var i=s.cols.indexOf("Status");
+ return s.rows.filter(function(r){return rowVisible(s,r)&&test(String(r[i]||""));}).length;}
+function renderKpis(){var k=document.getElementById("kpis");k.textContent="";
+ var n=Object.keys(D.servers).filter(serverIn).length;
+ var items=[["Servers in view",n,""],
+  ["OS past EOL",countRows("Operating Systems",function(v){return /^EOL/.test(v);}),"bad"],
+  ["DB engines past EOL",countRows("SQL / Database",function(v){return /^EOL/.test(v);}),"bad"],
+  ["Certificates expired",countRows("SSL Certificates",function(v){return v==="EXPIRED";}),"bad"],
+  ["Certificates <= 30 days",countRows("SSL Certificates",function(v){return v==="Expires <= 30 days";}),"warn"]];
+ items.forEach(function(x){var d=el("div","kpi "+x[2]);d.appendChild(el("b",null,String(x[1])));d.appendChild(el("span",null,x[0]));k.appendChild(d);});}
+function render(){
+ var nav=document.getElementById("nav");nav.textContent="";
+ D.sections.forEach(function(s,i){var host=document.getElementById("sec"+i);
+  if(!sectionVisible(s)){host.classList.add("hidden");return;}
+  host.classList.remove("hidden");var c=renderSection(s,i,host);
+  var a=el("a",null,s.name+" ("+c+")");a.href="#sec"+i;a.onclick=function(e){e.preventDefault();host.scrollIntoView({behavior:"smooth"});};nav.appendChild(a);});
+ renderKpis();
+ document.querySelectorAll("#roles .chip").forEach(function(b){var r=b.getAttribute("data-role");
+  b.setAttribute("aria-pressed",String(r===""?S.roles.length===0:S.roles.indexOf(r)>=0));});
+ document.getElementById("prob").setAttribute("aria-pressed",String(S.problems));
+ var h="roles="+S.roles.map(encodeURIComponent).join(",")+(S.problems?"&problems=1":"");
+ if(S.roles.length||S.problems){history.replaceState(null,"","#"+h);}else{history.replaceState(null,"",location.pathname+location.search);}}
+function readHash(){S.roles=[];S.problems=false;var h=location.hash.replace(/^#/,"");if(!h||h.indexOf("sec")===0)return;h.split("&").forEach(function(p){var kv=p.split("=");
+ if(kv[0]==="roles"&&kv[1])S.roles=kv[1].split(",").map(decodeURIComponent).filter(function(r){return D.groups.indexOf(r)>=0;});
+ if(kv[0]==="problems")S.problems=kv[1]==="1";});}
+function build(){
+ var m=D.meta;document.getElementById("meta").textContent="Generated "+m.generated+" by "+m.by+" on "+m.host+" \u00B7 Server Wizard v"+m.version+" \u00B7 "+Object.keys(D.servers).length+" server(s)";
+ var roles=document.getElementById("roles");
+ var all=el("button","chip","All roles");all.type="button";all.setAttribute("data-role","");all.onclick=function(){S.roles=[];render();};roles.appendChild(all);
+ D.groups.forEach(function(g){var n=Object.keys(D.servers).filter(function(s){return D.servers[s].indexOf(g)>=0;}).length;
+  var b=el("button","chip",g);b.type="button";b.setAttribute("data-role",g);b.appendChild(el("span","n",String(n)));
+  b.title="Click: show only "+g+" | Ctrl/Shift+click: add to selection";
+  b.onclick=function(e){var i=S.roles.indexOf(g);
+   if(e.ctrlKey||e.metaKey||e.shiftKey){if(i>=0)S.roles.splice(i,1);else S.roles.push(g);}
+   else{S.roles=(S.roles.length===1&&i===0)?[]:[g];}
+   render();};
+  roles.appendChild(b);});
+ var p=document.getElementById("prob");p.onclick=function(){S.problems=!S.problems;render();};
+ var q=document.getElementById("q"),t;q.oninput=function(){clearTimeout(t);t=setTimeout(function(){S.q=q.value.trim();render();},180);};
+ document.getElementById("reset").onclick=function(){S={roles:[],problems:false,q:""};q.value="";sortState={};render();};
+ var main=document.getElementById("sections");D.sections.forEach(function(s,i){var x=el("section");x.id="sec"+i;main.appendChild(x);});
+ readHash();render();
+ window.addEventListener("hashchange",function(){if(location.hash.indexOf("#sec")===0)return;readHash();render();});}
+build();
+})();
+'@
+
+    $title = 'Server Wizard - Role Report'
+    $srcs  = ($script:OfficialHosts | ForEach-Object { & $enc $_ }) -join ', '
+    return @"
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title</title>
+<style>$css</style></head><body>
+<header><h1>Server Wizard &ndash; Role-Based Report</h1><p id="meta"></p></header>
+<div class="bar">
+ <div class="row" id="roles"><span class="lbl">Roles</span></div>
+ <div class="row"><span class="lbl">Filter</span>
+  <button type="button" class="chip prob" id="prob" aria-pressed="false">Problems only (EOL / expiring)</button>
+  <input type="search" id="q" placeholder="Search server, product, version, certificate..." aria-label="Search">
+  <button type="button" class="btn" id="reset">Reset</button>
+ </div>
+</div>
+<main><div class="kpis" id="kpis"></div><nav id="nav"></nav><div id="sections"></div></main>
+<footer>Click a role to show only that role (Ctrl/Shift+click to combine), click a column header to sort. The address bar keeps the selected view, so the link can be bookmarked. Support and EOL dates come from official vendor sources only ($srcs). Install dates marked approx. are folder/binary creation times. Read-only inventory; no changes were made to any server.</footer>
+<script type="application/json" id="sw-data">$json</script>
+<script>$js</script>
+</body></html>
+"@
 }
 
 # CSV/Excel formula-injection guard for text cells
@@ -2261,18 +2455,29 @@ function ConvertTo-SafeCsvRow($row) {
     return [PSCustomObject]$o
 }
 
-function Invoke-RoleReport([ValidateSet('Html', 'Csv')][string]$Format) {
+function Invoke-RoleReport {
+    param(
+        [ValidateSet('Html', 'Csv')][string]$Format = 'Html',
+        [string[]]$Roles = @(),
+        [switch]$AllServers
+    )
     if ($script:Results.Keys.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Run a scan first.", "Export Report", "OK", "Information") | Out-Null
         return
     }
-    $keys  = Get-ReportServerKeys
+    $keys = Get-ReportServerKeys -Roles $Roles -AllServers:$AllServers
+    if ($keys.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No scanned server matches the selected roles.", "Export Report", "OK", "Information") | Out-Null
+        return
+    }
     $stamp = Get-Date -Format 'yyyyMMdd_HHmm'
+    $tag   = ''
+    if (@($Roles).Count -gt 0 -and @($Roles).Count -le 3) { $tag = '_' + ((@($Roles) | ForEach-Object { $_ -replace '[^A-Za-z0-9]+', '' }) -join '+') }
     $target = $null
     if ($Format -eq 'Html') {
         $dlg          = New-Object System.Windows.Forms.SaveFileDialog
         $dlg.Filter   = "HTML report (*.html)|*.html"
-        $dlg.FileName = "ServerWizard_RoleReport_$stamp.html"
+        $dlg.FileName = "ServerWizard_RoleReport${tag}_$stamp.html"
         if ($dlg.ShowDialog($form) -ne "OK") { return }
         $target = $dlg.FileName
     }
@@ -2286,10 +2491,11 @@ function Invoke-RoleReport([ValidateSet('Html', 'Csv')][string]$Format) {
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
         Write-Log "Role report ($Format) started for $($keys.Count) servers -> $target"
-        # Lifecycle dates are always re-checked against the official sources
-        Update-AllLifecycle
+        # Lifecycle dates are re-checked against the official sources
+        # (skipped only if that already happened in the last 15 minutes)
+        Update-LifecycleIfStale
         Build-SearchIndex
-        $sections = Get-ReportSections $keys
+        $sections = Get-ReportSections $keys $Roles
 
         if ($Format -eq 'Html') {
             $html = ConvertTo-HtmlReport $sections $keys
@@ -2303,7 +2509,7 @@ function Invoke-RoleReport([ValidateSet('Html', 'Csv')][string]$Format) {
                 $rows = @($sections[$name].Rows)
                 if ($rows.Count -eq 0) { continue }
                 $safe = ($name -replace '[\\/:*?"<>|&]', '' -replace '\s+', '_').Trim('_')
-                $file = Join-Path $target "ServerWizard_${stamp}_$safe.csv"
+                $file = Join-Path $target "ServerWizard_${stamp}${tag}_$safe.csv"
                 $rows | ForEach-Object { ConvertTo-SafeCsvRow $_ } |
                     Export-Csv -Path $file -NoTypeInformation -Encoding UTF8 -Delimiter ';'
                 $n++
@@ -2319,6 +2525,175 @@ function Invoke-RoleReport([ValidateSet('Html', 'Csv')][string]$Format) {
         Set-Status "Report failed (see log)." ([System.Drawing.Color]::Red)
     }
     finally { $form.Cursor = [System.Windows.Forms.Cursors]::Default }
+}
+
+# ============================================================================
+# Reports module (in-app): a "Reports" tab with a role selector, a sortable
+# grid of the selected report section and export / refresh buttons.
+# ============================================================================
+$script:ReportSections = $null
+$script:ReportKeys     = @()
+
+# Re-checks the official sources unless that already happened very recently
+function Update-LifecycleIfStale([int]$maxAgeMinutes = 15) {
+    if ($script:LifecycleRefreshed -and ((Get-Date) - $script:LifecycleRefreshed).TotalMinutes -lt $maxAgeMinutes) { return }
+    Update-AllLifecycle
+}
+
+function ConvertTo-ReportTable($rows) {
+    $dt = New-Object System.Data.DataTable
+    $rows = @($rows)
+    $cols = @()
+    foreach ($row in $rows) { foreach ($p in $row.PSObject.Properties.Name) { if ($cols -notcontains $p) { $cols += $p } } }
+    foreach ($c in $cols) { [void]$dt.Columns.Add($c, [string]) }
+    foreach ($row in $rows) {
+        $dr = $dt.NewRow()
+        foreach ($c in $cols) {
+            $p = $row.PSObject.Properties[$c]
+            $dr[$c] = if ($p -and $null -ne $p.Value) { "$($p.Value)" } else { '' }
+        }
+        [void]$dt.Rows.Add($dr)
+    }
+    return ,$dt
+}
+
+function Show-ReportSection {
+    $ui = $script:ReportsUi
+    if (-not $ui -or -not $script:ReportSections) { return }
+    $name = "$($ui.Combo.SelectedItem)" -replace '\s+\(\d+\)$', ''
+    if (-not $script:ReportSections.Contains($name)) { return }
+    $sec = $script:ReportSections[$name]
+    $ui.Grid.DataSource = $null
+    $ui.Grid.DataSource = (ConvertTo-ReportTable $sec.Rows)
+    $ui.Info.Text = "$($sec.Description)   |   $(@($sec.Rows).Count) row(s), $($script:ReportKeys.Count) server(s). Double-click a row to open the server."
+}
+
+function Update-ReportsTab([bool]$refreshLifecycle = $false) {
+    $ui = $script:ReportsUi
+    if (-not $ui) { return }
+    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        if ($refreshLifecycle) { $script:LifecycleRefreshed = $null }
+        Update-LifecycleIfStale
+        $script:ReportKeys     = Get-ReportServerKeys
+        $script:ReportSections = Get-ReportSections $script:ReportKeys
+        $prev = "$($ui.Combo.SelectedItem)" -replace '\s+\(\d+\)$', ''
+        $ui.Combo.BeginUpdate()
+        $ui.Combo.Items.Clear()
+        foreach ($n in $script:ReportSections.Keys) { [void]$ui.Combo.Items.Add("$n ($(@($script:ReportSections[$n].Rows).Count))") }
+        $ui.Combo.EndUpdate()
+        $idx = 0
+        for ($i = 0; $i -lt $ui.Combo.Items.Count; $i++) { if (("$($ui.Combo.Items[$i])" -replace '\s+\(\d+\)$', '') -eq $prev) { $idx = $i } }
+        if ($ui.Combo.Items.Count -gt 0) { $ui.Combo.SelectedIndex = $idx }   # triggers Show-ReportSection
+        $when = if ($script:LifecycleRefreshed) { $script:LifecycleRefreshed.ToString('yyyy-MM-dd HH:mm') } else { '-' }
+        Set-Status "Reports ready for $($script:ReportKeys.Count) server(s). Official lifecycle data checked: $when" $script:OkGreen
+    }
+    catch {
+        Write-Log "REPORTS TAB FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        Set-Status "Reports failed: $($_.Exception.Message) (see log)" ([System.Drawing.Color]::Red)
+    }
+    finally { $form.Cursor = [System.Windows.Forms.Cursors]::Default }
+}
+
+function Open-ReportsTab {
+    if ($script:Results.Keys.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No inventory yet - run a scan first.", "Reports", "OK", "Information") | Out-Null
+        return
+    }
+    foreach ($t in $tabs.TabPages) {
+        if ($t.Text -eq 'Reports') { $tabs.SelectedTab = $t; Update-ReportsTab; return }
+    }
+    try {
+        $tp = New-Object System.Windows.Forms.TabPage ('Reports')
+        $tp.BackColor = [System.Drawing.Color]::White
+
+        $bar = New-Object System.Windows.Forms.Panel
+        $bar.Dock = 'Top'; $bar.Height = 64; $bar.BackColor = $script:MerlinBlueLt
+
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = 'Report:'; $lbl.AutoSize = $true; $lbl.Location = New-Object System.Drawing.Point(10, 12)
+
+        $cmb = New-Object System.Windows.Forms.ComboBox
+        $cmb.DropDownStyle = 'DropDownList'
+        $cmb.Location = New-Object System.Drawing.Point(64, 8); $cmb.Size = New-Object System.Drawing.Size(300, 23)
+
+        $mk = {
+            param($text, $x, $w, $primary)
+            $b = New-Object System.Windows.Forms.Button
+            $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, 6); $b.Size = New-Object System.Drawing.Size($w, 28)
+            $b.FlatStyle = 'Flat'
+            if ($primary) { $b.BackColor = $script:MerlinBlue; $b.ForeColor = [System.Drawing.Color]::White }
+            else { $b.BackColor = $script:MerlinYellow; $b.ForeColor = $script:MerlinBlue }
+            return $b
+        }
+        $btnRefresh = & $mk 'Refresh (official sources)' 374 180 $true
+        $btnHtml    = & $mk 'Export HTML...' 562 120 $false
+        $btnCsv     = & $mk 'Export CSV per role...' 690 160 $false
+
+        $info = New-Object System.Windows.Forms.Label
+        $info.AutoSize = $false; $info.Location = New-Object System.Drawing.Point(10, 40)
+        $info.Size = New-Object System.Drawing.Size(1200, 20); $info.ForeColor = [System.Drawing.Color]::DimGray
+        $info.Anchor = 'Top,Left,Right'
+
+        $bar.Controls.AddRange(@($lbl, $cmb, $btnRefresh, $btnHtml, $btnCsv, $info))
+
+        $grid = New-Object System.Windows.Forms.DataGridView
+        $grid.Dock = 'Fill'
+        $grid.ReadOnly = $true
+        $grid.AllowUserToAddRows = $false
+        $grid.AllowUserToDeleteRows = $false
+        $grid.RowHeadersVisible = $false
+        $grid.SelectionMode = 'FullRowSelect'
+        $grid.AutoSizeColumnsMode = 'DisplayedCells'
+        $grid.BackgroundColor = [System.Drawing.Color]::White
+        $grid.BorderStyle = 'None'
+        $grid.EnableHeadersVisualStyles = $false
+        $grid.ColumnHeadersDefaultCellStyle.BackColor = $script:MerlinBlue
+        $grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+        $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
+        $grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 253)
+        Set-DoubleBuffered $grid
+
+        # Status colouring (same rules as the HTML report)
+        $grid.Add_CellFormatting({
+            param($s, $e)
+            try {
+                if ($e.RowIndex -lt 0 -or $s.Columns[$e.ColumnIndex].Name -ne 'Status') { return }
+                switch (Get-StatusClass "$($e.Value)") {
+                    'bad'  { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(253, 232, 231); $e.CellStyle.ForeColor = [System.Drawing.Color]::FromArgb(180, 35, 24) }
+                    'warn' { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 241, 214); $e.CellStyle.ForeColor = [System.Drawing.Color]::FromArgb(154, 91, 0) }
+                    'soon' { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 251, 214); $e.CellStyle.ForeColor = [System.Drawing.Color]::FromArgb(122, 106, 0) }
+                    'ok'   { $e.CellStyle.BackColor = [System.Drawing.Color]::FromArgb(227, 245, 234); $e.CellStyle.ForeColor = $script:OkGreen }
+                }
+            } catch {}
+        })
+        $grid.Add_CellDoubleClick({
+            param($s, $e)
+            try {
+                if ($e.RowIndex -lt 0 -or -not $s.Columns.Contains('Server')) { return }
+                $srv = "$($s.Rows[$e.RowIndex].Cells['Server'].Value)"
+                if ($srv) { Open-ServerTab $srv.ToUpper() }
+            } catch { Write-Log "Report row open failed: $($_.Exception.Message)" }
+        })
+
+        $cmb.Add_SelectedIndexChanged({ try { Show-ReportSection } catch { Write-Log "Report section failed: $($_.Exception.Message)" } })
+        $btnRefresh.Add_Click({ Update-ReportsTab $true })
+        $btnHtml.Add_Click({ Invoke-RoleReport -Format Html })
+        $btnCsv.Add_Click({ Invoke-RoleReport -Format Csv })
+
+        $tp.Controls.Add($grid)
+        $tp.Controls.Add($bar)      # added last = docked first (top)
+        [void]$tabs.TabPages.Add($tp)
+        $tabs.SelectedTab = $tp
+        $script:ReportsUi = @{ Tab = $tp; Combo = $cmb; Grid = $grid; Info = $info }
+        $tp.Add_Disposed({ $script:ReportsUi = $null })
+        Update-ReportsTab
+    }
+    catch {
+        Write-Log "OPEN REPORTS FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        [System.Windows.Forms.MessageBox]::Show("Reports could not be opened: $($_.Exception.Message)`n`nSee log: $script:LogFile",
+            "Reports", "OK", "Error") | Out-Null
+    }
 }
 
 # --- Event handlers --------------------------------------------------------
@@ -2643,24 +3018,143 @@ function Export-ActiveTabCsv {
     Set-Status "Report saved for ${key}: $($dlg.FileName)" $script:OkGreen
 }
 
-# Export Report: drop-down with the role-based reports and the per-tab CSV
-$exportMenu = New-Object System.Windows.Forms.ContextMenuStrip
-$miHtml = $exportMenu.Items.Add("Role-based report (HTML, all selected servers)...")
-$miCsv  = $exportMenu.Items.Add("Role-based report (CSV per role, all selected servers)...")
-[void]$exportMenu.Items.Add("-")
-$miTab  = $exportMenu.Items.Add("Active tab only (CSV)...")
-$miHtml.Add_Click({ Invoke-RoleReport -Format Html })
-$miCsv.Add_Click({  Invoke-RoleReport -Format Csv })
-$miTab.Add_Click({
-    try { Export-ActiveTabCsv }
-    catch {
-        Write-Log "TAB EXPORT FAILED: $($_.Exception.Message)"
-        Set-Status "Export failed: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+# Export Report: one dialog to choose WHAT goes into the report (roles,
+# servers) and HOW (interactive HTML, CSV per role, active tab CSV), or to
+# open the in-app Reports view.
+function Show-ExportDialog {
+    if ($script:Results.Keys.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No inventory yet - run a scan first.", "Export Report", "OK", "Information") | Out-Null
+        return $null
     }
-})
+    $allKeys  = @($script:Results.Keys)
+    $checked  = @(Get-AllLeafNodes | Where-Object { $_.Checked } | ForEach-Object { Get-LeafName $_ } |
+                  Where-Object { $script:Results.ContainsKey($_) } | Sort-Object -Unique)
+    $counts = [ordered]@{}
+    foreach ($g in $script:GroupOrder) { $counts[$g] = 0 }
+    foreach ($k in $allKeys) { foreach ($g in @(Get-EffectiveGroups $k $script:Results[$k])) { if (-not $counts.Contains($g)) { $counts[$g] = 0 }; $counts[$g]++ } }
+    $activeTab = $tabs.SelectedTab
+    $tabOk = ($activeTab -and $activeTab.Text -notin 'Scan Progress', 'Reports')
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Export Report'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.ClientSize = New-Object System.Drawing.Size(470, 520)
+    $dlg.Font = $form.Font
+    $dlg.BackColor = [System.Drawing.Color]::White
+    $dlg.ShowInTaskbar = $false
+
+    $lblRoles = New-Object System.Windows.Forms.Label
+    $lblRoles.Text = 'Roles to include'; $lblRoles.ForeColor = $script:MerlinBlue
+    $lblRoles.Font = New-Object System.Drawing.Font($script:FontName, 10, [System.Drawing.FontStyle]::Bold)
+    $lblRoles.Location = New-Object System.Drawing.Point(14, 12); $lblRoles.AutoSize = $true
+
+    $lnkAll = New-Object System.Windows.Forms.LinkLabel
+    $lnkAll.Text = 'All'; $lnkAll.AutoSize = $true; $lnkAll.Location = New-Object System.Drawing.Point(370, 15)
+    $lnkNone = New-Object System.Windows.Forms.LinkLabel
+    $lnkNone.Text = 'None'; $lnkNone.AutoSize = $true; $lnkNone.Location = New-Object System.Drawing.Point(410, 15)
+
+    $clb = New-Object System.Windows.Forms.CheckedListBox
+    $clb.CheckOnClick = $true
+    $clb.Location = New-Object System.Drawing.Point(14, 38); $clb.Size = New-Object System.Drawing.Size(442, 214)
+    $roleOf = @{}
+    foreach ($g in $counts.Keys) {
+        if ($counts[$g] -eq 0) { continue }
+        $text = "$g  ($($counts[$g]))"
+        $roleOf[$text] = $g
+        [void]$clb.Items.Add($text, $true)
+    }
+    $lnkAll.Add_LinkClicked({ for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $true) } })
+    $lnkNone.Add_LinkClicked({ for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $false) } })
+
+    $grpSrv = New-Object System.Windows.Forms.GroupBox
+    $grpSrv.Text = 'Servers'; $grpSrv.ForeColor = $script:MerlinBlue
+    $grpSrv.Location = New-Object System.Drawing.Point(14, 262); $grpSrv.Size = New-Object System.Drawing.Size(442, 76)
+    $rbChecked = New-Object System.Windows.Forms.RadioButton
+    $rbChecked.Text = "Servers checked in the list ($($checked.Count))"; $rbChecked.ForeColor = [System.Drawing.Color]::Black
+    $rbChecked.Location = New-Object System.Drawing.Point(12, 22); $rbChecked.AutoSize = $true
+    $rbAll = New-Object System.Windows.Forms.RadioButton
+    $rbAll.Text = "All scanned servers ($($allKeys.Count))"; $rbAll.ForeColor = [System.Drawing.Color]::Black
+    $rbAll.Location = New-Object System.Drawing.Point(12, 46); $rbAll.AutoSize = $true
+    if ($checked.Count -gt 0) { $rbChecked.Checked = $true } else { $rbChecked.Enabled = $false; $rbAll.Checked = $true }
+    $grpSrv.Controls.AddRange(@($rbChecked, $rbAll))
+
+    $grpFmt = New-Object System.Windows.Forms.GroupBox
+    $grpFmt.Text = 'Format'; $grpFmt.ForeColor = $script:MerlinBlue
+    $grpFmt.Location = New-Object System.Drawing.Point(14, 346); $grpFmt.Size = New-Object System.Drawing.Size(442, 100)
+    $rbHtml = New-Object System.Windows.Forms.RadioButton
+    $rbHtml.Text = 'Interactive HTML report (role filters, search, sorting)'; $rbHtml.ForeColor = [System.Drawing.Color]::Black
+    $rbHtml.Location = New-Object System.Drawing.Point(12, 22); $rbHtml.AutoSize = $true; $rbHtml.Checked = $true
+    $rbCsv = New-Object System.Windows.Forms.RadioButton
+    $rbCsv.Text = 'CSV files, one per role / section'; $rbCsv.ForeColor = [System.Drawing.Color]::Black
+    $rbCsv.Location = New-Object System.Drawing.Point(12, 46); $rbCsv.AutoSize = $true
+    $rbTab = New-Object System.Windows.Forms.RadioButton
+    $rbTab.Text = if ($tabOk) { "Active tab only (CSV): $($activeTab.Text)" } else { 'Active tab only (CSV) - open a server or search tab first' }
+    $rbTab.ForeColor = [System.Drawing.Color]::Black
+    $rbTab.Location = New-Object System.Drawing.Point(12, 70); $rbTab.AutoSize = $true; $rbTab.Enabled = $tabOk
+    $grpFmt.Controls.AddRange(@($rbHtml, $rbCsv, $rbTab))
+    $toggle = { $clb.Enabled = -not $rbTab.Checked; $grpSrv.Enabled = -not $rbTab.Checked }
+    $rbTab.Add_CheckedChanged($toggle)
+
+    $btnView = New-Object System.Windows.Forms.Button
+    $btnView.Text = 'Open in-app view'; $btnView.FlatStyle = 'Flat'; $btnView.ForeColor = $script:MerlinBlue
+    $btnView.Location = New-Object System.Drawing.Point(14, 470); $btnView.Size = New-Object System.Drawing.Size(140, 32)
+    $btnView.DialogResult = [System.Windows.Forms.DialogResult]::Retry
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Cancel'; $btnCancel.FlatStyle = 'Flat'
+    $btnCancel.Location = New-Object System.Drawing.Point(254, 470); $btnCancel.Size = New-Object System.Drawing.Size(90, 32)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'Export'; $btnOk.FlatStyle = 'Flat'
+    $btnOk.BackColor = $script:MerlinYellow; $btnOk.ForeColor = $script:MerlinBlue
+    $btnOk.Font = New-Object System.Drawing.Font($script:FontName, 9, [System.Drawing.FontStyle]::Bold)
+    $btnOk.Location = New-Object System.Drawing.Point(354, 470); $btnOk.Size = New-Object System.Drawing.Size(102, 32)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.AcceptButton = $btnOk; $dlg.CancelButton = $btnCancel
+
+    $dlg.Controls.AddRange(@($lblRoles, $lnkAll, $lnkNone, $clb, $grpSrv, $grpFmt, $btnView, $btnCancel, $btnOk))
+
+    try {
+        $res = $dlg.ShowDialog($form)
+        if ($res -eq [System.Windows.Forms.DialogResult]::Retry) { return @{ Action = 'View' } }
+        if ($res -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        if ($rbTab.Checked) { return @{ Action = 'Tab' } }
+        $roles = @(foreach ($item in $clb.CheckedItems) { $roleOf["$item"] })
+        if ($roles.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Select at least one role.", "Export Report", "OK", "Information") | Out-Null
+            return $null
+        }
+        # Every role ticked = no role filter (also keeps servers with no group)
+        if ($roles.Count -eq $clb.Items.Count) { $roles = @() }
+        return @{
+            Action     = 'Report'
+            Format     = if ($rbCsv.Checked) { 'Csv' } else { 'Html' }
+            Roles      = [string[]]$roles
+            AllServers = [bool]$rbAll.Checked
+        }
+    }
+    finally { $dlg.Dispose() }
+}
+
 $btnExport.Add_Click({
-    $miTab.Enabled = ($tabs.SelectedTab -and $tabs.SelectedTab.Text -ne 'Scan Progress')
-    $exportMenu.Show($btnExport, (New-Object System.Drawing.Point(0, $btnExport.Height)))
+    try {
+        Write-Log "Export Report clicked"
+        $choice = Show-ExportDialog
+        if (-not $choice) { return }
+        switch ($choice.Action) {
+            'View'   { Open-ReportsTab }
+            'Tab'    { Export-ActiveTabCsv }
+            'Report' {
+                Write-Log "Export: $($choice.Format), roles: $(if ($choice.Roles.Count) { $choice.Roles -join ', ' } else { 'all' }), all servers: $($choice.AllServers)"
+                Invoke-RoleReport -Format $choice.Format -Roles $choice.Roles -AllServers:$choice.AllServers
+            }
+        }
+    }
+    catch {
+        Write-Log "EXPORT FAILED: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+        Set-Status "Export Report failed: $($_.Exception.Message) (see log)" ([System.Drawing.Color]::Red)
+    }
 })
 
 $form.Add_FormClosing({
